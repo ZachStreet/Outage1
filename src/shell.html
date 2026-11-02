@@ -1,0 +1,168 @@
+<title>Outage</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Daily broken-network puzzles. Find the fault from a Cisco-style console, fix it, and prove it with a ping.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=Big+Shoulders+Display:wght@700;800&family=Red+Hat+Mono:wght@400;500;600&display=swap">
+<style>/*CSS*/</style>
+
+<header class="bar">
+  <div class="wrap bar-in">
+    <button class="wordmark" id="brand" type="button" aria-label="Outage, back to the panel">OUTAGE<span class="led led-r blink" id="brand-led" aria-hidden="true"></span></button>
+    <button class="navlink" id="nav-board" type="button" hidden>Leaderboard</button>
+    <div class="stats" id="stats"></div>
+  </div>
+</header>
+
+<main>
+  <section id="home" class="wrap">
+   <div class="home-grid">
+    <div class="hud" id="hud">
+      <p class="eyebrow">Daily network troubleshooting</p>
+      <h1>Something&rsquo;s<br>down<span class="stop">.</span></h1>
+      <p class="lede">Every outage is a small network with one thing broken. <strong>Find it from the console, fix it, and prove it with a ping.</strong> Five live ports in this prototype, from a shut interface to a missing return route.</p>
+    </div>
+
+    <div class="chassis">
+      <div class="ear" aria-hidden="true"><i></i><i></i></div>
+      <div class="face">
+        <div class="face-top">
+          <span class="model"><b>OUTAGE 12</b>Pick a port to patch in</span>
+          <div class="silk" aria-hidden="true">
+            <span><i class="led led-g"></i>SYST</span>
+            <span><i class="led led-g"></i>STAT</span>
+          </div>
+        </div>
+        <div class="ports" id="ports" role="group" aria-label="Outages. Each port is one broken network."></div>
+      </div>
+      <div class="ear" aria-hidden="true"><i></i><i></i></div>
+    </div>
+
+      <article class="detail" id="detail" aria-live="polite"></article>
+      <div class="demo" aria-label="Example console session">
+        <div><span class="p">R1#</span>ping 192.168.1.10</div>
+        <div class="dim">Sending 5, 100-byte ICMP Echos to 192.168.1.10, timeout is 2 seconds:</div>
+        <div class="bad">.....</div>
+        <div>Success rate is 0 percent (0/5)</div>
+        <div><span class="p">R1#</span>show ip interface brief</div>
+        <div>GigabitEthernet0/0   192.168.1.1   YES manual <span class="bad">administratively down</span> down</div>
+        <div><span class="p">R1#</span>configure terminal</div>
+        <div><span class="p">R1(config)#</span>interface g0/0</div>
+        <div><span class="p">R1(config-if)#</span>no shutdown</div>
+        <div class="sys">%LINEPROTO-5-UPDOWN: Line protocol on Interface GigabitEthernet0/0, changed state to up</div>
+        <div><span class="p">R1(config-if)#</span>do ping 192.168.1.10</div>
+        <div class="good">.!!!!</div>
+        <div>Success rate is 80 percent (4/5), round-trip min/avg/max = 0/0/1 ms</div>
+      </div>
+   </div>
+
+    <footer class="foot">
+      <span>Prototype. The console simulates a subset of Cisco IOS commands for practice.</span>
+      <span>Not affiliated with or endorsed by Cisco Systems.</span>
+    </footer>
+  </section>
+
+  <section id="play" class="wrap" hidden>
+    <div class="play">
+      <aside class="ticket" aria-label="Incident ticket">
+        <button class="textbtn back" id="back" type="button">Back to the panel</button>
+        <dl class="tk-form" id="tk-form"></dl>
+        <h1 class="tk-title" id="tk-title"></h1>
+        <p class="tk-story" id="tk-story"></p>
+        <div class="readouts">
+          <div><span class="lcd" id="st-time">0:00</span><span class="rd-l">Time</span></div>
+          <div><span class="lcd" id="st-cmds">0</span><span class="rd-l">Commands</span></div>
+          <div><span class="lcd" id="st-hints">0/3</span><span class="rd-l">Escalations</span></div>
+        </div>
+        <h2 class="tk-h">Test points</h2>
+        <ul class="tests" id="obj"></ul>
+        <h2 class="tk-h">Stuck?</h2>
+        <ol class="notes" id="hints"></ol>
+        <button class="btn btn-quiet" id="hint-btn" type="button"></button>
+      </aside>
+
+      <div class="bench">
+        <div class="map">
+          <div class="map-scroll">
+            <svg id="topo" viewBox="0 0 900 380" role="group" aria-label="Network map. Select a device to open its console.">
+              <g id="topo-static"></g>
+              <g id="topo-anim"></g>
+            </svg>
+          </div>
+          <div class="wire" aria-live="polite"><i class="led" id="wire-led"></i><span id="wire-text"></span></div>
+          <div class="legend" aria-label="Legend">
+            <span><i class="cable" style="background:var(--cat6)"></i>Access cable</span>
+            <span><i class="cable" style="background:var(--uplink)"></i>Uplink</span>
+            <span><i class="cable" style="background:var(--wan)"></i>WAN link</span>
+            <span><i class="dot" style="background:var(--cat6)"></i>Ping</span>
+            <span><i class="dot" style="background:var(--led-a)"></i>ARP broadcast</span>
+            <span><i class="dot" style="background:var(--led-g)"></i>Reply</span>
+          </div>
+        </div>
+
+        <div class="term">
+          <div class="tabs" id="tabs" role="tablist" aria-label="Device consoles"></div>
+          <div class="pcswitch" id="pcswitch" hidden>
+            <button class="seg" type="button" id="seg-cmd" aria-pressed="true">Command prompt</button>
+            <button class="seg" type="button" id="seg-ip" aria-pressed="false">IP settings</button>
+          </div>
+          <div class="term-body" id="term-body">
+            <div class="screen" id="screen"></div>
+            <form class="cli" id="cli-form" autocomplete="off">
+              <label for="cli" id="prompt">R1&gt;</label>
+              <input id="cli" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send" aria-label="Command">
+            </form>
+            <div class="keys">
+              <button class="key" type="button" data-key="tab">Tab</button>
+              <button class="key" type="button" data-key="help">?</button>
+              <button class="key" type="button" data-key="up">&uarr;</button>
+              <button class="key" type="button" data-key="down">&darr;</button>
+              <span class="key-note">Tab completes. ? lists options. Abbreviations work.</span>
+            </div>
+          </div>
+          <form class="ipset" id="ipset" hidden novalidate>
+            <label for="ip-addr">IPv4 address<input id="ip-addr" inputmode="decimal" autocomplete="off" spellcheck="false"></label>
+            <label for="ip-mask">Subnet mask<input id="ip-mask" inputmode="decimal" autocomplete="off" spellcheck="false"></label>
+            <label for="ip-gw">Default gateway<input id="ip-gw" inputmode="decimal" autocomplete="off" spellcheck="false"></label>
+            <div class="ipset-row"><button class="btn btn-go" type="submit">Save settings</button><span class="ipset-msg" id="ip-msg" role="status"></span></div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="board" class="wrap" hidden>
+    <div class="board-head">
+      <div class="hud board-hud">
+        <p class="eyebrow">Everyone who&rsquo;s played</p>
+        <h1>Leaderboard<span class="stop">.</span></h1>
+      </div>
+      <div class="board-actions">
+        <button class="btn btn-quiet" id="board-refresh" type="button">Refresh</button>
+        <button class="btn btn-go" id="board-play" type="button">Back to the panel</button>
+      </div>
+    </div>
+    <div class="board-tabs" id="board-tabs" role="tablist" aria-label="Leaderboard view"></div>
+    <div class="board-card">
+      <div class="board-scroll" id="board-body" aria-live="polite"></div>
+    </div>
+    <p class="board-note">Ranked by fastest time, then fewest escalations, then fewest commands. Each player&rsquo;s best run per outage counts.</p>
+  </section>
+</main>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="win" role="dialog" aria-modal="true" aria-labelledby="win-title">
+    <h2 class="tape win-tape" id="win-title">Network restored</h2>
+    <p class="win-sub"><i class="led led-g"></i><span id="win-sub"></span></p>
+    <p class="win-rank" id="win-rank"></p>
+    <div class="readouts" id="win-stats"></div>
+    <div class="win-notes"><h3>Resolution notes</h3><p id="win-explain"></p></div>
+    <div class="share"><h3>Your result</h3><pre id="share-text"></pre><button class="push" type="button" id="copy">Copy result</button></div>
+    <div class="post" id="post" hidden aria-live="polite"></div>
+    <div class="win-actions"><button class="btn btn-go" type="button" id="win-next">Next outage</button><button class="btn btn-quiet" type="button" id="win-home">Back to the panel</button></div>
+  </div>
+</div>
+
+<script>/*ENGINE*/</script>
+<script>/*PUZZLES*/</script>
+<script>/*APP*/</script>
