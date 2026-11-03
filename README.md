@@ -9,36 +9,37 @@ Daily broken-network puzzles with a leaderboard. Something's down.
 | `build.js` | Builds `src/` into `public/index.html`, the page Netlify serves |
 | `netlify/functions/scores.mjs` | The leaderboard API at `/api/scores` |
 | `lib/board.mjs` | Leaderboard rules: validation, best run per outage, ranking |
-| `test/` | Tests. Run `npm test` |
+| `test/` | Tests. `npm test` for the engine and leaderboard, `npm run test:e2e` for the browser test |
 | `netlify.toml` | Tells Netlify how to build: `npm run build`, publish `public`, functions in `netlify/functions` |
 
-## One-time setup: deploy from GitHub
+## How updates go live
 
-The leaderboard runs as a Netlify Function, and functions need a Git or CLI deploy. A drag-and-drop deploy only publishes the static page. Switch your existing Netlify project to build from GitHub once:
+Netlify builds from this repository. Every commit to `main` is published automatically, usually within a minute. A pull request gets its own preview link from Netlify first, and merging it publishes it.
 
-1. On GitHub, create a new repository called `outage`. Private is fine.
-2. On the new repo's page, choose **uploading an existing file**, drag in everything from this folder, and commit.
-3. In Netlify, open your existing project and link it to that repository. This is under the project's build and deploy settings, as **Link repository** or similar. Pick GitHub, then `outage`. Netlify reads `netlify.toml`, so leave the build settings as they are.
-4. Wait about a minute for the first build. Then open `https://<your-site>.netlify.app/api/scores`. You should see `{"players":[]}`.
-
-Your site keeps its existing address.
-
-## Day-to-day updates
-
-- **Change anything:** edit the file on GitHub (pencil icon), then commit. Netlify rebuilds and publishes automatically, usually within a minute.
-- **Add an outage:** copy one of the objects in `src/puzzles.js`, give it the next id (`p6`, `p7`...), and change the devices, fault, story, test points and hints. It appears on the next free port of the switch. The leaderboard accepts it automatically.
-- **Check a deploy:** the Deploys tab in Netlify shows each build. If a build fails, the previous version stays live.
+- **Change anything:** edit the file on GitHub (pencil icon), then commit. If a build fails, the previous version stays live.
+- **Check a deploy:** the Deploys tab in Netlify shows each build.
 - **Roll back:** in Deploys, open an older deploy and publish it.
+
+## Adding a day of outages
+
+The home page is a rack with one switch per day, newest on top. Each switch holds that day's five outages, easy to hard.
+
+1. In `src/puzzles.js`, add the day and its date to `DAYS`, for example `3: '2026-11-04'`.
+2. Add five puzzle objects with `day: 3` and the next ids and numbers (`p11` to `p15`, `num: 11` to `15`). Copying an existing outage is the quickest start. Their order in the file is their port order.
+3. Add the fix for each one to `FIXES` in `test/engine.test.js` and `FIX` in `test/e2e.mjs`, then run the tests.
+
+A day appears on its date, in each player's own time zone, so you can add several days in advance. The leaderboard picks up new outages automatically.
+
+What the simulator supports: access ports, VLANs, 802.1Q trunks (allowed lists, native VLAN, CDP mismatch logs), router interfaces, subinterfaces for router-on-a-stick, static and default routes with longest-prefix matching, ARP, ping and tracert, and PC IP settings.
 
 ## Run it on your computer (optional)
 
 ```
 npm install
-npm test
-npx netlify-cli dev
+npm test            # engine and leaderboard tests
+npm run test:e2e    # builds, then plays all outages in a headless browser
+npx netlify-cli dev # the page, the function and local leaderboard storage together
 ```
-
-`netlify dev` runs the page, the function and a local copy of the leaderboard storage together.
 
 ## How the leaderboard works
 

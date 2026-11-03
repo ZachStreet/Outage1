@@ -10,9 +10,15 @@
   const prefixLen = m => { let n = ip2n(m), c = 0; while (n) { c += n & 1; n = n >>> 1; } return c; };
   const netOf = (ip, m) => (ip2n(ip) & ip2n(m)) >>> 0;
   const inNet = (ip, net, m) => netOf(ip, m) === netOf(net, m);
-  const HOSTS = ['pc', 'server', 'printer'];
+  const HOSTS = ['pc', 'server', 'printer', 'camera'];
   const IF_TYPES = [['GigabitEthernet', 'Gi'], ['FastEthernet', 'Fa']];
   const shortIf = n => { for (const [l, s] of IF_TYPES) if (n.indexOf(l) === 0) return s + n.slice(l.length); return n; };
+  const cdpIf = n => n.replace(/^GigabitEthernet/, 'Gig ').replace(/^FastEthernet/, 'Fas ');
+  // Router subinterfaces (router on a stick) are named like GigabitEthernet0/0.20.
+  const isSub = n => n.indexOf('.') >= 0;
+  const parentIf = n => n.split('.')[0];
+  const ifNums = n => (n.match(/\d+/g) || []).map(Number);
+  const ifSort = (a, b) => { const x = ifNums(a), y = ifNums(b); for (let i = 0; i < Math.max(x.length, y.length); i++) { if (x[i] === undefined) return -1; if (y[i] === undefined) return 1; if (x[i] !== y[i]) return x[i] - y[i]; } return 0; };
   const uniqSort = a => Array.from(new Set(a)).sort((x, y) => x - y);
   const pad = (s, n) => { s = String(s); return s.length >= n ? s + ' ' : s + ' '.repeat(n - s.length); };
   const L = (t, s) => ({ t, s });
@@ -56,7 +62,7 @@
     isRouter(name) { return this.devices[name].type === 'router'; }
     ifaceNames(name) {
       const d = this.devices[name];
-      if (d.type === 'router') return Object.keys(d.ifaces);
+      if (d.type === 'router') return Object.keys(d.ifaces).sort(ifSort);
       if (d.type === 'switch') return Object.keys(d.ports);
       return ['FastEthernet0'];
     }
@@ -66,24 +72,34 @@
       if (d.type === 'switch') return d.ports[ifn];
       return d;
     }
-    resolveIf(name, token) {
-      const m = /^([a-z]+)(\d+(?:\/\d+)*)$/i.exec(token);
+    // allowNew lets `interface g0/0.20` create a subinterface on a router, like IOS does.
+    resolveIf(name, token, allowNew) {
+      const m = /^([a-z]+)(\d+(?:\/\d+)*)(?:\.(\d+))?$/i.exec(token);
       if (!m) return null;
-      const pre = m[1].toLowerCase();
+      const pre = m[1].toLowerCase(), names = this.ifaceNames(name);
       for (const [long] of IF_TYPES) {
-        if (long.toLowerCase().indexOf(pre) === 0) {
-          const full = long + m[2];
-          if (this.ifaceNames(name).indexOf(full) >= 0) return full;
-        }
+        if (long.toLowerCase().indexOf(pre) !== 0) continue;
+        const full = long + m[2];
+        if (names.indexOf(full) < 0) continue;
+        if (m[3] === undefined) return full;
+        if (!this.isRouter(name) || +m[3] < 1 || +m[3] > 4094) return null;
+        const sub = full + '.' + Number(m[3]);
+        return names.indexOf(sub) >= 0 || allowNew ? sub : null;
       }
       return null;
+    }
+    subFor(name, phys, vlan) {
+      const d = this.devices[name];
+      return Object.keys(d.ifaces).find(k => isSub(k) && parentIf(k) === phys && d.ifaces[k].encap === vlan) || null;
     }
     adminUp(name, ifn) {
       if (this.isHost(name)) return true;
       const c = this.ifaceCfg(name, ifn);
+      if (isSub(ifn)) return !!c && !c.shutdown && this.adminUp(name, parentIf(ifn));
       return !!c && !c.shutdown;
     }
     peer(name, ifn) {
+      ifn = parentIf(ifn);
       for (let i = 0; i < this.links.length; i++) {
         const l = this.links[i];
         if (l.a === name && l.ai === ifn) return { dev: l.b, ifn: l.bi, link: i };
@@ -93,6 +109,12 @@
     }
     linkUp(i) { const l = this.links[i]; return this.adminUp(l.a, l.ai) && this.adminUp(l.b, l.bi); }
     status(name, ifn) {
+      if (isSub(ifn)) {
+        const c = this.ifaceCfg(name, ifn);
+        if (c && c.shutdown) return { status: 'administratively down', protocol: 'down' };
+        const ps = this.status(name, parentIf(ifn));
+        return ps.status === 'administratively down' ? { status: 'down', protocol: 'down' } : ps;
+      }
       if (!this.adminUp(name, ifn)) return { status: 'administratively down', protocol: 'down' };
       const p = this.peer(name, ifn);
       if (!p || !this.adminUp(p.dev, p.ifn)) return { status: 'down', protocol: 'down' };
@@ -103,7 +125,7 @@
       if (this.isHost(name)) return d.ip && d.mask ? { ip: d.ip, mask: d.mask } : null;
       if (d.type === 'router') {
         const c = d.ifaces[ifn];
-        if (!c || !c.ip || this.status(name, ifn).protocol !== 'up') return null;
+        if (!c || !c.ip || (isSub(ifn) && !c.encap) || this.status(name, ifn).protocol !== 'up') return null;
         return { ip: c.ip, mask: c.mask };
       }
       return null;
@@ -120,7 +142,14 @@
       const endpoints = [], edges = [];
       if (!this.adminUp(srcDev, srcIf)) return { endpoints, edges };
       const seen = new Set();
-      const q = [{ from: srcDev, fromIf: srcIf, vlan: null, tagged: false, path: [] }];
+      // A subinterface sends out of its physical port, tagged with its dot1Q VLAN.
+      let start = { from: srcDev, fromIf: srcIf, vlan: null, tagged: false, path: [] };
+      if (isSub(srcIf)) {
+        const c = this.ifaceCfg(srcDev, srcIf);
+        if (!c || !c.encap) return { endpoints, edges };
+        start = { from: srcDev, fromIf: parentIf(srcIf), vlan: c.encap, tagged: true, path: [] };
+      }
+      const q = [start];
       while (q.length) {
         const f = q.shift();
         const p = this.peer(f.from, f.fromIf);
@@ -129,6 +158,12 @@
         const path = f.path.concat([hop]);
         edges.push(hop);
         const d = this.devices[p.dev];
+        if (d.type === 'router') {
+          // Tagged frames land on the subinterface for that VLAN; untagged ones on the physical port.
+          if (!f.tagged) endpoints.push({ dev: p.dev, ifn: p.ifn, path });
+          else { const sub = this.subFor(p.dev, p.ifn, f.vlan); if (sub && this.adminUp(p.dev, sub)) endpoints.push({ dev: p.dev, ifn: sub, path }); }
+          continue;
+        }
         if (d.type !== 'switch') { if (!f.tagged) endpoints.push({ dev: p.dev, ifn: p.ifn, path }); continue; }
         const port = d.ports[p.ifn];
         let v;
@@ -157,7 +192,7 @@
       const d = this.devices[name], out = [];
       for (const n of Object.keys(d.ifaces)) {
         const c = d.ifaces[n];
-        if (!c.ip || this.status(name, n).protocol !== 'up') continue;
+        if (!c.ip || (isSub(n) && !c.encap) || this.status(name, n).protocol !== 'up') continue;
         out.push({ code: 'C', net: n2ip(netOf(c.ip, c.mask)), mask: c.mask, ifn: n, nh: null });
         out.push({ code: 'L', net: c.ip, mask: '255.255.255.255', ifn: n, nh: null });
       }
@@ -175,6 +210,22 @@
         if (pl > bl || (pl === bl && e.code === 'C' && best.code !== 'C')) { best = e; bl = pl; }
       }
       return best;
+    }
+
+    // Trunks whose two ends disagree on the native VLAN. CDP reports these on both switches.
+    nativeMismatches() {
+      const out = [];
+      this.links.forEach((l, i) => {
+        const A = this.devices[l.a], B = this.devices[l.b];
+        if (A.type !== 'switch' || B.type !== 'switch' || !this.linkUp(i)) return;
+        const pa = A.ports[l.ai], pb = B.ports[l.bi];
+        if (pa.mode !== 'trunk' || pb.mode !== 'trunk') return;
+        const na = pa.native || 1, nb = pb.native || 1;
+        if (na === nb) return;
+        out.push({ dev: l.a, ifn: l.ai, native: na, peer: B.hostname || l.b, peerIf: l.bi, peerNative: nb });
+        out.push({ dev: l.b, ifn: l.bi, native: nb, peer: A.hostname || l.a, peerIf: l.ai, peerNative: na });
+      });
+      return out.map(m => Object.assign(m, { line: '%CDP-4-NATIVE_VLAN_MISMATCH: Native VLAN mismatch discovered on ' + m.ifn + ' (' + m.native + '), with ' + m.peer + ' ' + m.peerIf + ' (' + m.peerNative + ').' }));
     }
 
     // One-way packet walk from a device toward dst.
@@ -254,7 +305,9 @@
     remove: 'remove VLANs from the current list', all: 'all VLANs', 'running-config': 'Current operating configuration',
     interfaces: 'Interface status and configuration', brief: 'Brief summary of IP status and configuration', status: 'Show interface line status',
     description: 'Interface specific description', do: 'To run exec commands in config mode', write: 'Write running configuration to memory',
-    memory: 'Write to NV memory', copy: 'Copy from one file to another', 'startup-config': 'Copy to startup configuration'
+    memory: 'Write to NV memory', copy: 'Copy from one file to another', 'startup-config': 'Copy to startup configuration',
+    encapsulation: 'Set encapsulation type for an interface', dot1q: 'IEEE 802.1Q Virtual LAN', cdp: 'CDP information',
+    neighbors: 'CDP neighbor entries'
   };
   const PARAM_SHOW = { IP: ['A.B.C.D', 'IP address'], MASK: ['A.B.C.D', 'IP subnet mask'], VLAN: ['<1-4094>', 'VLAN ID'], VLANLIST: ['WORD', 'VLAN IDs of the allowed VLANs, e.g. 10,20,30-40'], WORD: ['WORD', 'Name'], LINE: ['LINE', 'Text'] };
 
@@ -262,7 +315,7 @@
     const toks = [], re = /\S+/g; let m;
     while ((m = re.exec(line))) toks.push({ s: m[0], pos: m.index });
     for (let i = 0; i < toks.length - 1; i++) {
-      if (/^[a-z]+$/i.test(toks[i].s) && /^\d+(\/\d+)+$/.test(toks[i + 1].s)) { toks[i] = { s: toks[i].s + toks[i + 1].s, pos: toks[i].pos }; toks.splice(i + 1, 1); }
+      if (/^[a-z]+$/i.test(toks[i].s) && /^\d+(\/\d+)+(\.\d+)?$/.test(toks[i + 1].s)) { toks[i] = { s: toks[i].s + toks[i + 1].s, pos: toks[i].pos }; toks.splice(i + 1, 1); }
     }
     return toks;
   }
@@ -277,12 +330,17 @@
     { m: 'UP', t: 'S', p: ['show', 'vlan', 'brief'], f() { return this.showVlanBrief(); } },
     { m: 'UP', t: 'S', p: ['show', 'interfaces', 'trunk'], f() { return this.showTrunk(); } },
     { m: 'UP', t: 'S', p: ['show', 'interfaces', 'status'], f() { return this.showIntStatus(); } },
+    { m: 'UP', t: 'S', p: ['show', 'interfaces', 'switchport'], f() { return this.showSwitchport(); } },
+    { m: 'UP', p: ['show', 'cdp', 'neighbors'], f() { return this.showCdp(); } },
     { m: 'P', p: ['show', 'running-config'], f() { return this.showRun(); } },
     { m: 'P', p: ['configure', 'terminal'], f() { this.mode = 'config'; return [L('out', 'Enter configuration commands, one per line.  End with CNTL/Z.')]; } },
     { m: 'P', p: ['write', 'memory'], f() { return [L('out', 'Building configuration...'), L('out', '[OK]')]; } },
     { m: 'P', p: ['copy', 'running-config', 'startup-config'], f() { return [L('out', 'Destination filename [startup-config]? '), L('out', 'Building configuration...'), L('out', '[OK]')]; } },
     { m: 'C', p: ['hostname', 'WORD'], f(v) { this.d.hostname = v[0]; } },
-    { m: 'CI', p: ['interface', 'IFACE'], f(v) { this.mode = 'config-if'; this.ifn = v[0]; } },
+    { m: 'CI', p: ['interface', 'IFACE'], f(v) {
+      if (!this.net.ifaceCfg(this.name, v[0])) { this.d.ifaces[v[0]] = { ip: null, mask: null, shutdown: false, encap: null }; this.net.touch(); }
+      this.mode = 'config-if'; this.ifn = v[0];
+    } },
     { m: 'C', t: 'R', p: ['ip', 'route', 'IP', 'MASK', 'IP'], f(v) {
       const [net, mask, nh] = v;
       if (netOf(net, mask) !== ip2n(net)) return [L('err', '%Inconsistent address and mask')];
@@ -303,6 +361,7 @@
     { m: 'I', p: ['no', 'description'], f() { delete this.cfg().description; } },
     { m: 'I', t: 'R', p: ['ip', 'address', 'IP', 'MASK'], f(v) {
       const [ip, mask] = v;
+      if (isSub(this.ifn) && !this.cfg().encap) return [L('err', '% Configuring IP routing on a LAN subinterface is only allowed if that subinterface is already'), L('err', 'configured as part of an IEEE 802.10, IEEE 802.1Q, or ISL vLAN.')];
       if (netOf(ip, mask) === ip2n(ip) && prefixLen(mask) < 31) return [L('err', 'Bad mask /' + prefixLen(mask) + ' for address ' + ip)];
       for (const n of Object.keys(this.d.ifaces)) {
         const c = this.d.ifaces[n];
@@ -313,6 +372,11 @@
       const c = this.cfg(); c.ip = ip; c.mask = mask; this.net.touch();
     } },
     { m: 'I', t: 'R', p: ['no', 'ip', 'address'], f() { const c = this.cfg(); c.ip = null; c.mask = null; this.net.touch(); } },
+    { m: 'I', t: 'R', sub: true, p: ['encapsulation', 'dot1q', 'VLAN'], f(v) {
+      const other = this.net.subFor(this.name, parentIf(this.ifn), v[0]);
+      if (other && other !== this.ifn) return [L('err', '% Configuration of multiple subinterfaces of the same main interface with the same VID (' + v[0] + ') is not permitted.'), L('err', 'This VID is already configured on ' + other + '.')];
+      this.cfg().encap = v[0]; this.net.touch();
+    } },
     { m: 'I', t: 'S', p: ['switchport', 'mode', 'access'], f() { this.cfg().mode = 'access'; this.net.touch(); } },
     { m: 'I', t: 'S', p: ['switchport', 'mode', 'trunk'], f() { this.cfg().mode = 'trunk'; this.net.touch(); } },
     { m: 'I', t: 'S', p: ['switchport', 'access', 'vlan', 'VLAN'], f(v) {
@@ -331,6 +395,7 @@
     { m: 'I', t: 'S', p: ['switchport', 'trunk', 'allowed', 'vlan', 'VLANLIST'], f(v) { this.cfg().allowed = v[0]; this.net.touch(); } },
     { m: 'I', t: 'S', p: ['no', 'switchport', 'trunk', 'allowed', 'vlan'], f() { this.cfg().allowed = 'all'; this.net.touch(); } },
     { m: 'I', t: 'S', p: ['switchport', 'trunk', 'native', 'vlan', 'VLAN'], f(v) { this.cfg().native = v[0]; this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['no', 'switchport', 'trunk', 'native', 'vlan'], f() { this.cfg().native = 1; this.net.touch(); } },
     { m: 'CIV', p: ['exit'], f() { this.mode = this.mode === 'config' ? 'priv' : 'config'; this.ifn = null; this.vlan = null; } },
     { m: 'CIV', p: ['end'], f() { this.mode = 'priv'; this.ifn = null; this.vlan = null; return [L('sys', '%SYS-5-CONFIG_I: Configured from console by console')]; } },
     { m: 'CIV', p: ['do', 'LINE'], f(v) { return this.execIn(v[0], 'priv'); } }
@@ -340,14 +405,17 @@
     constructor(net, name, log) { this.net = net; this.name = name; this.log = log || function () {}; this.mode = 'user'; this.ifn = null; this.vlan = null; }
     get d() { return this.net.devices[this.name]; }
     host() { return this.d.hostname || this.name; }
-    prompt() { return this.host() + ({ user: '>', priv: '#', config: '(config)#', 'config-if': '(config-if)#', 'config-vlan': '(config-vlan)#' })[this.mode]; }
+    prompt() { return this.host() + (this.mode === 'config-if' && this.ifn && isSub(this.ifn) ? '(config-subif)#' : ({ user: '>', priv: '#', config: '(config)#', 'config-if': '(config-if)#', 'config-vlan': '(config-vlan)#' })[this.mode]); }
     cfg() { return this.net.ifaceCfg(this.name, this.ifn); }
-    cmdsFor(mode) { const code = MODES[mode], t = this.d.type === 'router' ? 'R' : 'S'; return CMDS.filter(c => c.m.indexOf(code) >= 0 && (!c.t || c.t === t)); }
+    cmdsFor(mode) {
+      const code = MODES[mode], t = this.d.type === 'router' ? 'R' : 'S', sub = mode === 'config-if' && !!this.ifn && isSub(this.ifn);
+      return CMDS.filter(c => c.m.indexOf(code) >= 0 && (!c.t || c.t === t) && (!c.sub || sub));
+    }
     validate(p, s) {
       switch (p) {
         case 'IP': return isIP(s) ? s : undefined;
         case 'MASK': return isMask(s) ? s : undefined;
-        case 'IFACE': return this.net.resolveIf(this.name, s) || undefined;
+        case 'IFACE': return this.net.resolveIf(this.name, s, true) || undefined;
         case 'VLAN': return /^\d+$/.test(s) && +s >= 1 && +s <= 4094 ? +s : undefined;
         case 'VLANLIST': return /^[\d,-]+$/.test(s) ? (parseVlanList(s) || undefined) : undefined;
         case 'WORD': return s;
@@ -419,7 +487,7 @@
         const p = cd.c.p[i];
         if (p === undefined) { cr = true; return; }
         if (p === 'IFACE') {
-          const types = new Set(this.net.ifaceNames(this.name).map(n => n.replace(/[\d/]+$/, '')));
+          const types = new Set(this.net.ifaceNames(this.name).map(n => n.replace(/[\d/.]+$/, '')));
           types.forEach(t => { if (t.toLowerCase().indexOf(partial) === 0) opts.set(t, t + ' IEEE 802.3'); });
           return;
         }
@@ -530,9 +598,32 @@
       const d = this.d, out = [pad('Port', 10) + pad('Name', 19) + pad('Status', 13) + pad('Vlan', 11) + pad('Duplex', 8) + pad('Speed', 6) + 'Type'];
       Object.keys(d.ports).forEach(n => {
         const c = d.ports[n], st = this.net.status(this.name, n), gi = n.indexOf('Gigabit') === 0;
-        const s = c.shutdown ? 'disabled' : st.protocol === 'up' ? 'connected' : 'notconnect';
-        const up = s === 'connected';
+        const s = c.shutdown ? 'disabled' : st.protocol !== 'up' ? 'notconnect' : c.mode === 'access' && !d.vlans[c.vlan] ? 'inactive' : 'connected';
+        const up = s === 'connected' || s === 'inactive';
         out.push(pad(shortIf(n), 10) + pad((c.description || '').slice(0, 18), 19) + pad(s, 13) + pad(c.mode === 'trunk' ? 'trunk' : c.vlan, 11) + pad(up ? 'a-full' : 'auto', 8) + pad(up ? (gi ? 'a-1000' : 'a-100') : 'auto', 6) + (gi ? '10/100/1000BaseTX' : '10/100BaseTX'));
+      });
+      return out.map(s => L('out', s));
+    }
+    showSwitchport() {
+      const d = this.d, out = [], vn = v => v + ' (' + (d.vlans[v] || 'Inactive') + ')';
+      Object.keys(d.ports).forEach(n => {
+        const c = d.ports[n], tr = c.mode === 'trunk', up = this.net.status(this.name, n).protocol === 'up';
+        out.push('Name: ' + shortIf(n), 'Switchport: Enabled', 'Administrative Mode: ' + (tr ? 'trunk' : 'static access'),
+          'Operational Mode: ' + (!up ? 'down' : tr ? 'trunk' : 'static access'), 'Administrative Trunking Encapsulation: dot1q',
+          'Negotiation of Trunking: ' + (tr ? 'On' : 'Off'), 'Access Mode VLAN: ' + vn(c.vlan || 1), 'Trunking Native Mode VLAN: ' + vn(c.native || 1),
+          'Trunking VLANs Enabled: ' + (c.allowed === 'all' ? 'ALL' : fmtVlans(c.allowed)), '');
+      });
+      return out.map(s => L('out', s));
+    }
+    showCdp() {
+      const out = ['Capability Codes: R - Router, T - Trans Bridge, B - Source Route Bridge', '                  S - Switch, H - Host, I - IGMP, r - Repeater, P - Phone', '',
+        pad('Device ID', 17) + pad('Local Intrfce', 18) + pad('Holdtme', 11) + pad('Capability', 12) + pad('Platform', 10) + 'Port ID'];
+      this.net.ifaceNames(this.name).filter(n => !isSub(n)).forEach((n, i) => {
+        if (this.net.status(this.name, n).protocol !== 'up') return;
+        const p = this.net.peer(this.name, n);
+        if (!p || this.net.isHost(p.dev)) return;
+        const pd = this.net.devices[p.dev], r = pd.type === 'router';
+        out.push(pad(pd.hostname || p.dev, 17) + pad(cdpIf(n), 18) + pad(151 + (i * 7) % 29, 11) + pad(r ? 'R B S I' : 'S I', 12) + pad(r ? 'ISR4321' : 'WS-C2960', 10) + cdpIf(p.ifn));
       });
       return out.map(s => L('out', s));
     }
@@ -540,10 +631,11 @@
       const d = this.d, c = [];
       c.push('!', 'version 15.2', 'no service timestamps log datetime msec', '!', 'hostname ' + this.host(), '!');
       if (d.type === 'router') {
-        Object.keys(d.ifaces).forEach(n => {
+        this.net.ifaceNames(this.name).forEach(n => {
           const x = d.ifaces[n];
           c.push('interface ' + n);
           if (x.description) c.push(' description ' + x.description);
+          if (isSub(n) && x.encap) c.push(' encapsulation dot1Q ' + x.encap);
           c.push(x.ip ? ' ip address ' + x.ip + ' ' + x.mask : ' no ip address');
           if (x.shutdown) c.push(' shutdown');
           c.push('!');

@@ -20,22 +20,15 @@
     <div class="hud" id="hud">
       <p class="eyebrow">Daily network troubleshooting</p>
       <h1>Something&rsquo;s<br>down<span class="stop">.</span></h1>
-      <p class="lede">Every outage is a small network with one thing broken. <strong>Find it from the console, fix it, and prove it with a ping.</strong> Five live ports in this prototype, from a shut interface to a missing return route.</p>
+      <p class="lede">Every outage is a small network with one thing broken. <strong>Find it from the console, fix it, and prove it with a ping.</strong> Each day gets its own switch in the rack: five outages, easy to hard.</p>
     </div>
 
-    <div class="chassis">
-      <div class="ear" aria-hidden="true"><i></i><i></i></div>
-      <div class="face">
-        <div class="face-top">
-          <span class="model"><b>OUTAGE 12</b>Pick a port to patch in</span>
-          <div class="silk" aria-hidden="true">
-            <span><i class="led led-g"></i>SYST</span>
-            <span><i class="led led-g"></i>STAT</span>
-          </div>
-        </div>
-        <div class="ports" id="ports" role="group" aria-label="Outages. Each port is one broken network."></div>
+    <div class="rack-wrap">
+      <div class="rack-top">
+        <span class="model"><b>RACK A</b>Pick a port to patch in. Newest day on top.</span>
+        <span class="rack-count" id="rack-count"></span>
       </div>
-      <div class="ear" aria-hidden="true"><i></i><i></i></div>
+      <div class="rack" id="rack" tabindex="0" role="region" aria-label="Rack of switches, one per day. Each port is one broken network. Scroll for earlier days."></div>
     </div>
 
       <article class="detail" id="detail" aria-live="polite"></article>

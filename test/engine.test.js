@@ -24,8 +24,14 @@ const FIXES = {
   p2: s => s.run('SW1', 'en', 'conf t', 'int fa0/2', 'switchport access vlan 10'),
   p3: s => { const d = s.net.devices['Scanner-PC']; d.gw = '192.168.30.1'; s.net.touch(); },
   p4: s => s.run('SW1', 'en', 'conf t', 'int g0/1', 'switchport trunk allowed vlan add 20'),
-  p5: s => s.run('R2', 'en', 'conf t', 'ip route 192.168.1.0 255.255.255.0 10.0.0.1')
+  p5: s => s.run('R2', 'en', 'conf t', 'ip route 192.168.1.0 255.255.255.0 10.0.0.1'),
+  p6: s => s.run('SW2', 'en', 'conf t', 'vlan 30', 'name DESIGN', 'end'),
+  p7: s => s.run('R1', 'en', 'conf t', 'int g0/1', 'no ip address', 'int g0/2', 'ip address 192.168.40.1 255.255.255.0'),
+  p8: s => s.run('SW1', 'en', 'conf t', 'int g0/1', 'switchport trunk native vlan 1'),
+  p9: s => s.run('R1', 'en', 'conf t', 'interface g0/0.20', 'encapsulation dot1Q 20'),
+  p10: s => s.run('R1', 'en', 'conf t', 'no ip route 172.16.50.128 255.255.255.128 10.0.0.3')
 };
+const P = id => PUZ.find(p => p.id === id);
 PUZ.forEach(p => {
   t(p.id + ' starts broken', () => { const s = setup(p); assert.strictEqual(objOk(s.net, p)[0], false); });
   t(p.id + ' fixed by intended commands', () => {
@@ -54,6 +60,96 @@ t('p5 R2 itself can ping app server (the HQ claim)', () => { const s = setup(PUZ
 t('p5 tracert shows hop 1 then timeouts', () => { const s = setup(PUZ[4]); const tr = s.net.tracert('Branch-PC', '172.16.20.10'); assert.deepStrictEqual(tr.rows, ['192.168.1.1', null, null]); assert.strictEqual(tr.done, false); });
 t('p5 tracert after fix', () => { const s = setup(PUZ[4]); FIXES.p5(s); const tr = s.net.tracert('Branch-PC', '172.16.20.10'); assert.deepStrictEqual(tr.rows, ['192.168.1.1', '10.0.0.2', '172.16.20.10']); assert.ok(tr.done); });
 t('p4 flood dies at SW1', () => { const s = setup(PUZ[3]); const r = s.net.ping('Lab-PC', '192.168.20.100'); assert.strictEqual(r.kind, 'arp'); assert.deepStrictEqual(r.fwd.hops.map(h => h.from + '>' + h.to), ['Lab-PC>SW2', 'SW2>SW1']); });
+
+// ---------- Day 2 ----------
+t('every puzzle has a day, unique id and num, and a dated day', () => {
+  const ids = new Set(PUZ.map(p => p.id)), nums = new Set(PUZ.map(p => p.num));
+  assert.strictEqual(ids.size, PUZ.length); assert.strictEqual(nums.size, PUZ.length);
+  PUZ.forEach(p => { assert.ok(PUZ.DAYS[p.day], p.id + ' has no date'); assert.ok(p.hints.length === 3 && p.objectives.length >= 2, p.id); });
+});
+t('"still" objectives pass at the start (they guard against breaking something else)', () => {
+  PUZ.forEach(p => { const s = setup(p), ok = objOk(s.net, p); p.objectives.forEach((o, i) => { if (/still/.test(o.text)) assert.ok(ok[i], p.id + ': ' + o.text); }); });
+});
+t('p6 port in deleted VLAN shows inactive; trunk drops VLAN 30', () => {
+  const s = setup(P('p6'));
+  const st = text(s.sh.SW2.exec('show interfaces status')); assert.ok(/Fa0\/1\s+inactive\s+30/.test(st), st);
+  const sw = text(s.sh.SW2.exec('show interfaces switchport')); assert.ok(/Access Mode VLAN: 30 \(Inactive\)/.test(sw), sw);
+  const vb = text(s.sh.SW2.exec('show vlan brief')); assert.ok(!/Fa0\/1/.test(vb), vb);
+  const tr = text(s.sh.SW2.exec('show interfaces trunk')); assert.ok(/active in management domain\nGi0\/1\s+1,10$/m.test(tr), tr);
+  const r = s.net.ping('Design-PC', '192.168.30.50'); assert.strictEqual(r.kind, 'arp'); assert.strictEqual(r.at, 'Design-PC');
+});
+t('p6 after fix the port is connected again', () => { const s = setup(P('p6')); FIXES.p6(s); assert.ok(/Fa0\/1\s+connected\s+30/.test(text(s.sh.SW2.exec('show interfaces status')))); });
+t('p7 overlap is rejected until the old address is removed', () => {
+  const s = setup(P('p7')); const r = s.run('R1', 'en', 'conf t', 'int g0/2', 'ip address 192.168.40.1 255.255.255.0');
+  assert.ok(/overlaps with GigabitEthernet0\/1/.test(text(r[3])), text(r[3])); assert.ok(!objOk(s.net, P('p7'))[0]);
+});
+t('p7 clues: brief shows Gi0/1 down with the address; CDP shows switch on Gi0/2', () => {
+  const s = setup(P('p7')); s.run('R1', 'en');
+  const b = text(s.sh.R1.exec('show ip interface brief'));
+  assert.ok(/GigabitEthernet0\/1\s+192\.168\.40\.1\s+YES manual down\s+down/.test(b), b);
+  assert.ok(/GigabitEthernet0\/2\s+unassigned\s+YES unset\s+up\s+up/.test(b), b);
+  const c = text(s.sh.R1.exec('show cdp neighbors')); assert.ok(/^SW1\s+Gig 0\/2\s+\d+\s+S I\s+WS-C2960\s+Gig 0\/1$/m.test(c), c);
+  assert.ok(!/Mail-Server/.test(c), 'hosts do not speak CDP');
+});
+t('p8 native mismatch reported on both switches with the IOS log format', () => {
+  const s = setup(P('p8')); const m = s.net.nativeMismatches();
+  assert.strictEqual(m.length, 2);
+  assert.strictEqual(m[0].line, '%CDP-4-NATIVE_VLAN_MISMATCH: Native VLAN mismatch discovered on GigabitEthernet0/1 (10), with SW2 GigabitEthernet0/1 (1).');
+  assert.strictEqual(m[1].dev, 'SW2');
+  FIXES.p8(s); assert.strictEqual(s.net.nativeMismatches().length, 0);
+});
+t('p8 VLAN 10 from SW1 lands in VLAN 1 on SW2', () => {
+  const s = setup(P('p8')); const r = s.net.ping('Staff-PC1', '192.168.10.12');
+  assert.strictEqual(r.kind, 'arp'); assert.deepStrictEqual(r.fwd.hops.map(h => h.from + '>' + h.to), ['Staff-PC1>SW1', 'SW1>SW2']);
+  const tr = text(s.sh.SW1.exec('show interfaces trunk')); assert.ok(/Gi0\/1\s+on\s+802\.1q\s+trunking\s+10$/m.test(tr), tr);
+});
+t('p8 alt: matching native 10 on SW2, or `no switchport trunk native vlan` on SW1', () => {
+  let s = setup(P('p8')); s.run('SW2', 'en', 'conf t', 'int g0/1', 'sw tr nat vl 10'); assert.ok(objOk(s.net, P('p8')).every(Boolean));
+  s = setup(P('p8')); s.run('SW1', 'en', 'conf t', 'int g0/1', 'no switchport trunk native vlan'); assert.ok(objOk(s.net, P('p8')).every(Boolean));
+});
+t('p9 subinterfaces: prompt, ordering, show run, routing table', () => {
+  const s = setup(P('p9')); s.run('R1', 'en');
+  const b = text(s.sh.R1.exec('sh ip int br')).split('\n').map(l => l.split(/\s+/)[0]);
+  assert.deepStrictEqual(b.slice(1), ['GigabitEthernet0/0', 'GigabitEthernet0/0.10', 'GigabitEthernet0/0.20', 'GigabitEthernet0/1', 'GigabitEthernet0/2']);
+  assert.ok(/interface GigabitEthernet0\/0\.20\n encapsulation dot1Q 30\n ip address 192\.168\.20\.1 255\.255\.255\.0/.test(text(s.sh.R1.exec('show run'))));
+  assert.ok(/C\s+192\.168\.20\.0\/24 is directly connected, GigabitEthernet0\/0\.20/.test(text(s.sh.R1.exec('show ip route'))));
+  s.run('R1', 'conf t', 'int g0/0.20'); assert.strictEqual(s.sh.R1.prompt(), 'R1(config-subif)#');
+  s.run('R1', 'exit', 'int g0/0'); assert.strictEqual(s.sh.R1.prompt(), 'R1(config-if)#');
+  assert.ok(/Invalid input/.test(text(s.sh.R1.exec('encapsulation dot1Q 20'))), 'encapsulation only on subinterfaces');
+});
+t('p9 failure: R1 tags printer traffic for VLAN 30 and SW1 drops it', () => {
+  const s = setup(P('p9')); const r = s.net.ping('Office-PC', '192.168.20.30');
+  assert.strictEqual(r.stage, 'request'); assert.strictEqual(r.kind, 'arp'); assert.strictEqual(r.at, 'R1');
+  assert.ok(!s.net.ping('Laser-Printer', '192.168.20.1').ok, 'printer cannot reach its gateway either');
+});
+t('p9 new subinterface needs encapsulation before an address', () => {
+  const s = setup(P('p9')); const r = s.run('R1', 'en', 'conf t', 'int g0/0.40', 'ip address 192.168.40.1 255.255.255.0');
+  assert.ok(/only allowed if that subinterface is already/.test(text(r[3])), text(r[3]));
+  const r2 = s.run('R1', 'encapsulation dot1q 40', 'ip address 192.168.40.1 255.255.255.0');
+  assert.ok(!r2.some(x => x.lines.length), r2.map(text).join('|'));
+  assert.ok(/GigabitEthernet0\/0\.40\s+192\.168\.40\.1/.test(text(s.sh.R1.exec('do sh ip int br'))));
+});
+t('p9 two subinterfaces cannot share a VLAN tag', () => {
+  const s = setup(P('p9')); const r = s.run('R1', 'en', 'conf t', 'int g0/0.20', 'encapsulation dot1Q 10');
+  assert.ok(/same VID \(10\) is not permitted/.test(text(r[3])), text(r[3]));
+  assert.ok(/encapsulation dot1Q 30/.test(text(s.sh.R1.exec('do show run'))));
+});
+t('p9 fixed: TTL shows one router hop', () => {
+  const s = setup(P('p9')); FIXES.p9(s); s.net.ping('Office-PC', '192.168.20.30');
+  assert.ok(/TTL=127/.test(text(s.sh['Office-PC'].exec('ping 192.168.20.30'))));
+});
+t('p10 longest match: /25 wins for .200, /24 for .10', () => {
+  const s = setup(P('p10'));
+  const r = s.net.ping('Ops-PC', '172.16.50.200'); assert.strictEqual(r.at, 'R1'); assert.strictEqual(r.kind, 'arp'); assert.strictEqual(r.nh, '10.0.0.3');
+  assert.deepStrictEqual(s.net.tracert('Ops-PC', '172.16.50.200').rows, ['192.168.1.1']);
+  assert.deepStrictEqual(s.net.tracert('Ops-PC', '172.16.50.10').rows, ['192.168.1.1', '10.0.0.2', '172.16.50.10']);
+  const rt = text(s.sh.R1.exec('show ip route'));
+  assert.ok(/S\s+172\.16\.50\.0\/24 \[1\/0\] via 10\.0\.0\.2/.test(rt) && /S\s+172\.16\.50\.128\/25 \[1\/0\] via 10\.0\.0\.3/.test(rt), rt);
+});
+t('p10 alt: re-pointing the /25 at R2 also works', () => {
+  const s = setup(P('p10')); s.run('R1', 'en', 'conf t', 'no ip route 172.16.50.128 255.255.255.128 10.0.0.3', 'ip route 172.16.50.128 255.255.255.128 10.0.0.2');
+  assert.ok(objOk(s.net, P('p10')).every(Boolean));
+});
 
 // ---------- CLI behaviour ----------
 t('abbreviations', () => {
