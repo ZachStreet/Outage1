@@ -1,11 +1,12 @@
 {
   "name": "outage",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Daily broken-network puzzles with a leaderboard.",
   "scripts": {
     "build": "node build.js",
-    "test": "node test/engine.test.js && node test/board.test.mjs"
+    "test": "node test/engine.test.js && node test/board.test.mjs",
+    "test:e2e": "node build.js && node test/e2e.mjs"
   },
   "dependencies": {
     "@netlify/blobs": "^11.1.7"

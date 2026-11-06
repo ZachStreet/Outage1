@@ -1,14 +1,21 @@
 (function () {
   'use strict';
   const { Network, IOSShell, PCShell, shortIf, isIP, isMask, HOSTS } = window.Outage;
-  const PUZ = window.OUTAGE_PUZZLES;
+  const DAYS = window.OUTAGE_DAYS || {};
+  const dayKey = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const TODAY = dayKey(new Date());
+  // A day's switch appears on its date, in the player's own time zone.
+  const PUZ = window.OUTAGE_PUZZLES.filter(p => !DAYS[p.day] || DAYS[p.day] <= TODAY);
+  const DAYLIST = Array.from(new Set(PUZ.map(p => p.day))).sort((a, b) => b - a);
+  const dayPuz = d => PUZ.filter(p => p.day === d);
+  const portOf = p => dayPuz(p.day).indexOf(p) + 1;
+  const dayDate = (d, opts) => { const k = DAYS[d]; if (!k) return ''; const [y, m, dd] = k.split('-').map(Number); return new Date(y, m - 1, dd).toLocaleDateString('en-AU', opts || { weekday: 'short', day: 'numeric', month: 'short' }); };
   const $ = s => document.querySelector(s);
   const SVGNS = 'http://www.w3.org/2000/svg';
   const RM = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   const md = s => esc(s).replace(/`([^`]+)`/g, '<code>$1</code>');
   const fmtTime = s => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
-  const PORTS = 12;
   const DIFF = ['', 'Easy', 'Medium', 'Hard'];
   const ESC = [['Ask a colleague', 'Colleague'], ['Escalate to a senior engineer', 'Senior engineer'], ['Open a vendor support case', 'Vendor support']];
   const SITE = !!window.OUTAGE_SITE;
@@ -30,7 +37,6 @@
   const TITLES = ['Help desk', 'NOC tech', 'Network engineer', 'Senior engineer', 'Principal engineer'];
   const PER = 600;
   const level = xp => { const lv = Math.floor(xp / PER) + 1; return { lv, title: TITLES[Math.min(TITLES.length - 1, lv - 1)], pct: Math.round((xp % PER) / PER * 100) }; };
-  const dayKey = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
   function streak() {
     const set = new Set(PR.days || []), d = new Date(); let n = 0;
     if (!set.has(dayKey(d))) d.setDate(d.getDate() - 1);
@@ -50,39 +56,49 @@
   function setBrandLed(up) { const l = $('#brand-led'); l.className = 'led ' + (up ? 'led-g' : 'led-r blink'); }
   function setHudStatus(allUp) { $('#hud').classList.toggle('all-up', allUp); }
 
-  // ---------- home: the switch panel ----------
+  // ---------- home: a rack with one switch per day, newest on top ----------
   let selected = null, posted = false;
-  function renderPanel() {
-    const next = PUZ.find(p => !PR.solved[p.id]);
-    if (!selected || !PUZ.some(p => p.id === selected)) selected = (next || PUZ[0]).id;
-    const box = $('#ports'); box.innerHTML = '';
-    for (let n = 1; n <= PORTS; n++) {
-      const p = PUZ[n - 1], b = document.createElement('button');
-      b.type = 'button'; b.className = 'port'; b.style.setProperty('--i', n);
-      if (p) {
-        const solved = !!PR.solved[p.id], isNext = next && p.id === next.id, isSel = p.id === selected;
-        const led = solved ? 'led-g' : 'led-r' + (isNext ? ' blink' : '');
-        b.setAttribute('aria-pressed', String(isSel));
-        b.setAttribute('aria-label', `Port ${n}, ${p.title}, ${solved ? 'fixed' : 'down'}`);
-        b.innerHTML = `<span class="port-num" aria-hidden="true">${n}</span><span class="led ${led}"></span><span class="jack"><span class="jack-hole"></span>${isSel ? '<span class="boot"></span>' : ''}</span><span class="tape port-tape">${esc(p.title)}</span>`;
-        b.onclick = () => { selected = p.id; renderPanel(); renderDetail(); };
-      } else {
-        b.disabled = true; b.title = 'Spare port. More outages are coming.';
-        b.setAttribute('aria-label', `Port ${n}, spare`);
-        b.innerHTML = `<span class="port-num" aria-hidden="true">${n}</span><span class="led"></span><span class="jack"><span class="jack-hole"></span></span>`;
-      }
-      box.appendChild(b);
-    }
+  function nextUp() { for (const d of DAYLIST) { const n = dayPuz(d).find(p => !PR.solved[p.id]); if (n) return n; } return null; }
+  function renderPanel(scrollToSel) {
+    const next = nextUp();
+    if (!selected || !PUZ.some(p => p.id === selected)) selected = (next || dayPuz(DAYLIST[0])[0]).id;
+    const rack = $('#rack'), keep = rack.scrollTop;
+    let i = 0;
+    rack.innerHTML = DAYLIST.map(d => {
+      const list = dayPuz(d), up = list.filter(p => PR.solved[p.id]).length, today = DAYS[d] === TODAY;
+      const stat = up === list.length ? 'led-g' : up ? 'led-a' : 'led-r';
+      const ports = list.map((p, k) => {
+        const solved = !!PR.solved[p.id], isSel = p.id === selected, isNext = next && p.id === next.id;
+        return `<button type="button" class="port" data-id="${p.id}" style="--i:${i++}" aria-pressed="${isSel}" aria-label="Day ${d}, port ${k + 1}, ${esc(p.title)}, ${solved ? 'fixed' : 'down'}">` +
+          `<span class="port-num" aria-hidden="true">${k + 1}</span><span class="led ${solved ? 'led-g' : 'led-r' + (isNext ? ' blink' : '')}"></span>` +
+          `<span class="jack"><span class="jack-hole"></span>${isSel ? '<span class="boot"></span>' : ''}</span><span class="tape port-tape">${esc(p.title)}</span></button>`;
+      }).join('');
+      return `<div class="unit${list.some(p => p.id === selected) ? ' is-sel' : ''}" data-day="${d}" role="group" aria-label="Day ${d}${DAYS[d] ? ', ' + esc(dayDate(d, { weekday: 'long', day: 'numeric', month: 'long' })) : ''}. ${up} of ${list.length} fixed.">` +
+        `<div class="ear" aria-hidden="true"><i></i><i></i></div><div class="face">` +
+        `<div class="u-id"><span class="tape u-day">Day ${d}</span><span class="u-date">${esc(dayDate(d))}${today ? ' <b>Today</b>' : ''}</span><span class="u-model">OUTAGE 5</span></div>` +
+        `<div class="ports">${ports}</div>` +
+        `<div class="u-stat" aria-hidden="true"><div class="silk"><span><i class="led led-g"></i>SYST</span><span><i class="led ${stat}"></i>STAT</span></div><span class="u-count"><b>${up}</b>/${list.length} up</span></div>` +
+        `</div><div class="ear" aria-hidden="true"><i></i><i></i></div></div>`;
+    }).join('') + '<div class="unit unit-blank" aria-hidden="true"><div class="ear"><i></i><i></i></div><div class="face"><span class="vents"></span></div><div class="ear"><i></i><i></i></div></div>';
+    rack.querySelectorAll('.port').forEach(b => { b.onclick = () => { selected = b.getAttribute('data-id'); renderPanel(); renderDetail(); }; });
+    rack.scrollTop = keep;
+    if (scrollToSel) { const u = rack.querySelector('.unit.is-sel'); if (u) rack.scrollTop = Math.max(0, u.offsetTop - 10); }
+    rackFade();
+    $('#rack-count').textContent = `${PUZ.filter(p => PR.solved[p.id]).length}/${PUZ.length} fixed across ${DAYLIST.length} ${DAYLIST.length === 1 ? 'day' : 'days'}`;
     if (!posted && !RM) {
-      posted = true; box.classList.add('post');
-      setTimeout(() => box.classList.remove('post'), PORTS * 55 + 950);
+      posted = true; rack.classList.add('post');
+      setTimeout(() => rack.classList.remove('post'), i * 55 + 950);
     }
   }
+  // Fade the bottom edge while there are more switches below, so it reads as scrollable.
+  function rackFade() { const r = $('#rack'); r.classList.toggle('more-below', r.scrollTop + r.clientHeight < r.scrollHeight - 4); }
+  $('#rack').addEventListener('scroll', rackFade, { passive: true });
+  window.addEventListener('resize', rackFade);
   function renderDetail() {
     const p = PUZ.find(x => x.id === selected), s = PR.solved[p.id];
     $('#detail').innerHTML = `
       <div class="d-main">
-        <p class="d-port">Port ${p.num}</p>
+        <p class="d-port">Day ${p.day}${DAYS[p.day] ? ', ' + esc(dayDate(p.day)) : ''} · Port ${portOf(p)}</p>
         <h2 class="d-title">${esc(p.title)}</h2>
         <p class="d-teaser">${esc(p.teaser)}</p>
         <button class="btn btn-go" id="start" type="button">${s ? 'Fix it again' : 'Start troubleshooting'}</button>
@@ -108,12 +124,12 @@
     $('#play').hidden = true; $('#board').hidden = true; $('#home').hidden = false; navCurrent(false);
     const allFixed = PUZ.every(p => PR.solved[p.id]);
     setBrandLed(allFixed); setHudStatus(allFixed);
-    renderPanel(); renderDetail(); renderStats(); window.scrollTo(0, 0);
+    renderPanel(true); renderDetail(); renderStats(); window.scrollTo(0, 0);
   }
 
   // ---------- game ----------
   let G = null, timer = null;
-  const KIND = { router: 'router', switch: 'switch', pc: 'PC', server: 'server', printer: 'printer' };
+  const KIND = { router: 'router', switch: 'switch', pc: 'PC', server: 'server', printer: 'printer', camera: 'camera' };
   const ln = (t, s) => ({ t, s });
 
   function openPuzzle(p) {
@@ -133,6 +149,9 @@
     });
     $('#home').hidden = true; $('#board').hidden = true; $('#play').hidden = false; navCurrent(false);
     setBrandLed(false);
+    // Switches that disagree about a trunk's native VLAN have been logging it via CDP all along.
+    net.nativeMismatches().forEach(m => G.buf[m.dev].push(ln('sys', m.line), ln('sys', m.line), ln('dim', '')));
+    G.cdpAt = 0;
     renderTicket(); renderTopo(); renderTabs(); renderPane(); renderStats();
     setStatus('', 'Press Test next to a test point to watch the packet, or pick a device and start investigating.');
     timer = setInterval(tickStats, 1000);
@@ -145,13 +164,15 @@
     const p = G.p, pri = p.ticket.pri;
     $('#tk-form').innerHTML =
       `<dt>Ticket</dt><dd>${esc(p.ticket.id)}</dd><dt>Priority</dt><dd><span class="tape ${pri === 'P1' ? 'tape-r' : 'tape-y'}">${esc(pri)}</span></dd>` +
-      `<dt>Opened</dt><dd>${esc(p.ticket.opened)}</dd><dt>Port</dt><dd>${p.num}</dd>`;
+      `<dt>Opened</dt><dd>${esc(p.ticket.opened)}</dd><dt>Port</dt><dd>Day ${p.day}, ${portOf(p)}</dd>`;
     $('#tk-title').textContent = p.title;
     $('#tk-story').textContent = p.story;
     renderObjectives(); renderHints(); tickStats();
   }
   function tickStats() {
     if (!G) return;
+    // CDP repeats the native VLAN complaint every minute until it's fixed.
+    if (!G.solved && elapsed() - G.cdpAt >= 60) { G.cdpAt = elapsed(); G.net.nativeMismatches().forEach(m => push(m.dev, [ln('sys', m.line)])); }
     $('#st-time').textContent = fmtTime(elapsed());
     $('#st-cmds').textContent = G.cmds;
     $('#st-hints').textContent = G.hints + '/' + G.p.hints.length;
@@ -183,7 +204,8 @@
     switch: { w: 46, h: 16, tape: 25, led: 58, svg: '<rect class="g-body" x="-44" y="-14" width="88" height="28" rx="4"/><circle class="g-pwr" cx="-34" cy="0" r="3"/>' + [0, 1, 2, 3, 4, 5].map(i => `<rect class="g-hole" x="${-22 + i * 10}" y="-8" width="7" height="6" rx="1"/><rect class="g-hole" x="${-22 + i * 10}" y="1" width="7" height="6" rx="1"/>`).join('') },
     pc: { w: 25, h: 22, tape: 28, led: 38, svg: '<rect class="g-body" x="-23" y="-21" width="46" height="31" rx="3"/><rect class="g-screen" x="-18" y="-16" width="36" height="21" rx="1.5"/><path class="g-line" d="M0 10V17M-11 18H11"/>' },
     server: { w: 20, h: 28, tape: 35, led: 36, svg: '<rect class="g-body" x="-17" y="-27" width="34" height="54" rx="3"/><rect class="g-hole" x="-11" y="-20" width="22" height="5" rx="1"/><rect class="g-hole" x="-11" y="-11" width="22" height="5" rx="1"/><rect class="g-hole" x="-11" y="-2" width="22" height="5" rx="1"/><circle class="g-pwr" cx="8" cy="17" r="2.6"/>' },
-    printer: { w: 25, h: 24, tape: 28, led: 38, svg: '<rect class="g-body" x="-14" y="-23" width="28" height="12" rx="2"/><rect class="g-body" x="-23" y="-12" width="46" height="23" rx="3"/><rect class="g-hole" x="-14" y="4" width="28" height="4" rx="1"/><path class="g-line" d="M-12 11V19H12V11"/>' }
+    printer: { w: 25, h: 24, tape: 28, led: 38, svg: '<rect class="g-body" x="-14" y="-23" width="28" height="12" rx="2"/><rect class="g-body" x="-23" y="-12" width="46" height="23" rx="3"/><rect class="g-hole" x="-14" y="4" width="28" height="4" rx="1"/><path class="g-line" d="M-12 11V19H12V11"/>' },
+    camera: { w: 25, h: 20, tape: 26, led: 36, svg: '<path class="g-line" d="M-6 8V18M-15 19H3"/><rect class="g-body" x="-23" y="-15" width="34" height="23" rx="4"/><path class="g-body" d="M11 -9L23 -14V9L11 4Z"/><circle class="g-screen" cx="-6" cy="-3.5" r="7"/><circle class="g-pwr" cx="-17" cy="-9" r="2.2"/>' }
   };
   const cableType = (net, l) => {
     const A = net.devices[l.a].type, B = net.devices[l.b].type;
@@ -195,35 +217,110 @@
     const x = w + 8, y = h + 8, k = 9;
     return `<path class="g-sel" d="M${-x} ${-y + k}V${-y}H${-x + k}M${x - k} ${-y}H${x}V${-y + k}M${x} ${y - k}V${y}H${x - k}M${-x + k} ${y}H${-x}V${y - k}"/>`;
   }
-  function renderTopo() {
-    const net = G.net, p = G.p; let s = '';
-    (p.labels || []).forEach(l => { s += `<text class="c-net" x="${l.x}" y="${l.y}" text-anchor="middle">${esc(l.t)}</text>`; });
+  // ---------- map label layout ----------
+  // Every label (port names, roles, IPs, subnet notes) is placed where it overlaps no device, LED, other label or cable.
+  // Candidates are scored and the cheapest wins, so crowded switches push labels further along their cables.
+  const VB = { w: 900, h: 380 };
+  const CW = { port: 6.95, sub: 6.95, net: 7.6 };
+  const tapeW = n => Math.round(n.length * 7.7 + 16);
+  const hit = (a, b, pad) => a.x1 < b.x2 + pad && b.x1 < a.x2 + pad && a.y1 < b.y2 + pad && b.y1 < a.y2 + pad;
+  function segHit(s, r, pad) {
+    const x1 = r.x1 - pad, y1 = r.y1 - pad, x2 = r.x2 + pad, y2 = r.y2 + pad, dx = s[2] - s[0], dy = s[3] - s[1];
+    const P = [-dx, dx, -dy, dy], Q = [s[0] - x1, x2 - s[0], s[1] - y1, y2 - s[1]];
+    let t0 = 0, t1 = 1;
+    for (let i = 0; i < 4; i++) {
+      if (P[i] === 0) { if (Q[i] < 0) return false; continue; }
+      const t = Q[i] / P[i];
+      if (P[i] < 0) { if (t > t1) return false; if (t > t0) t0 = t; } else { if (t < t0) return false; if (t < t1) t1 = t; }
+    }
+    return true;
+  }
+  const textBox = (x, y, w, anchor, size) => { const x1 = anchor === 'start' ? x : anchor === 'end' ? x - w : x - w / 2; return { x1, x2: x1 + w, y1: y - size * 0.78, y2: y + size * 0.24 }; };
+  function layoutMap(net, p) {
+    const devs = net.devices, names = Object.keys(devs), fixed = [], placed = [];
+    const segs = net.links.map(l => [devs[l.a].x, devs[l.a].y, devs[l.b].x, devs[l.b].y]);
+    names.forEach(n => {
+      const d = devs[n], g = GLYPH[d.type], tw = tapeW(n);
+      fixed.push({ x1: d.x - g.w, y1: d.y - g.h, x2: d.x + g.w, y2: d.y + g.h });
+      fixed.push({ x1: d.x - tw / 2, y1: d.y + g.tape, x2: d.x + tw / 2, y2: d.y + g.tape + 21 });
+    });
+    const ends = [];
     net.links.forEach((l, i) => {
-      const A = net.devices[l.a], B = net.devices[l.b];
-      const dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len;
-      const up = net.linkUp(i) && net.status(l.a, l.ai).protocol === 'up';
-      s += `<line class="c-link c-${cableType(net, l)}${up ? '' : ' is-down'}" x1="${A.x}" y1="${A.y}" x2="${B.x}" y2="${B.y}"/>`;
+      const A = devs[l.a], B = devs[l.b], dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len;
       [[l.a, l.ai, A, 1], [l.b, l.bi, B, -1]].forEach(([dn, ifn, D, sg]) => {
-        const st = net.status(dn, ifn), off = GLYPH[D.type].led;
-        const lx = D.x + ux * off * sg, ly = D.y + uy * off * sg;
-        let px = -uy, py = ux;
-        if (py < 0 || (py === 0 && px < 0)) { px = -px; py = -py; }
-        const tx = lx + ux * sg * 12 + px * 17, ty = ly + uy * sg * 12 + py * 17 + 4;
-        const anchor = px > 0.35 ? 'start' : px < -0.35 ? 'end' : 'middle';
-        s += `<circle class="c-led ${st.protocol === 'up' ? 'is-up' : 'is-down'}" cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="6"><title>${esc(dn + ' ' + ifn + ': ' + st.status + '/' + st.protocol)}</title></circle>`;
-        s += `<text class="c-port" x="${tx.toFixed(1)}" y="${ty.toFixed(1)}" text-anchor="${anchor}">${esc(shortIf(ifn))}</text>`;
+        const off = GLYPH[D.type].led, e = { i, dn, ifn, D, ux: ux * sg, uy: uy * sg, off, lx: D.x + ux * off * sg, ly: D.y + uy * off * sg };
+        ends.push(e); fixed.push({ x1: e.lx - 7, y1: e.ly - 7, x2: e.lx + 7, y2: e.ly + 7 });
       });
     });
+    // clear: how far a label must stay from cables. Labels also keep a gap from each other so two ports never read as one.
+    const cost = (b, own, clear) => {
+      let c = 0;
+      if (b.x1 < 3 || b.x2 > VB.w - 3 || b.y1 < 3 || b.y2 > VB.h - 2) c += 5000;
+      fixed.forEach(o => { if (hit(b, o, 2)) c += 1000; });
+      placed.forEach(o => { if (hit(b, o, 3)) c += 1000; else if (hit(b, o, 9)) c += 60; });
+      segs.forEach((sg, i) => { if (segHit(sg, b, 4)) c += i === own ? 500 : 260; else if (segHit(sg, b, clear)) c += 25; });
+      return c;
+    };
+    const pick = (cands, own, clear) => {
+      let best = null;
+      cands.forEach(c => { const v = cost(c.box, own, clear || 4) + c.pref; if (!best || v < best.v) best = Object.assign({ v }, c); });
+      placed.push(best.box); return best;
+    };
+    const out = { subs: {}, nets: [], ports: [] };
+    // 1. Text under each device: a host's IP, or a router's or switch's role. Hosts keep theirs below.
+    names.slice().sort((a, b) => HOSTS.indexOf(devs[b].type) - HOSTS.indexOf(devs[a].type)).forEach(n => {
+      const d = devs[n], g = GLYPH[d.type], host = HOSTS.indexOf(d.type) >= 0, t = host ? (d.ip || 'no IP') : (d.role || '');
+      if (!t) return;
+      const w = t.length * CW.sub, at = (dx, dy, anchor, pref) => ({ dx, dy, anchor, pref, box: textBox(d.x + dx, d.y + dy, w, anchor, 11.5) });
+      const cands = [at(0, g.tape + 36, 'middle', 0), at(0, -g.h - 9, 'middle', host ? 80 : 4), at(g.w + 10, 4, 'start', host ? 90 : 9), at(-g.w - 10, 4, 'end', host ? 90 : 11)];
+      out.subs[n] = Object.assign({ t }, pick(cands, -1, 12));
+    });
+    // 2. Subnet notes: nudge up or down from where the puzzle put them.
+    (p.labels || []).forEach(l => {
+      const w = l.t.length * CW.net, cands = [];
+      [0, -10, 10, -20, 20, -32, 32, -46, 46].forEach(dy => cands.push({ x: l.x, y: l.y + dy, pref: Math.abs(dy) * 0.6, box: textBox(l.x, l.y + dy, w, 'middle', 12.5) }));
+      out.nets.push(Object.assign({ t: l.t }, pick(cands, -1)));
+    });
+    // 3. Port names: beside their LED, sliding further along the cable when it's crowded.
+    ends.slice().sort((a, b) => GLYPH[b.D.type].led - GLYPH[a.D.type].led).forEach(e => {
+      const t = shortIf(e.ifn), w = t.length * CW.port, cands = [];
+      let nx = -e.uy, ny = e.ux; if (ny < 0 || (ny === 0 && nx < 0)) { nx = -nx; ny = -ny; }
+      [14, 26, 40, 56, 74].forEach((a, ai) => [1, -1].forEach(sd => [15, 23].forEach(q => {
+        const px = e.D.x + e.ux * (e.off + a) + nx * sd * q, py = e.D.y + e.uy * (e.off + a) + ny * sd * q + 4;
+        const sx = nx * sd, anchor = sx > 0.35 ? 'start' : sx < -0.35 ? 'end' : 'middle';
+        cands.push({ x: px, y: py, anchor, pref: ai * 7 + (q - 15) * 0.6 + (sd === 1 ? 0 : 2), box: textBox(px, py, w, anchor, 11.5) });
+      })));
+      // A label must sit nearer its own LED than any other, or it reads as the wrong port.
+      cands.forEach(c => {
+        const cx = (c.box.x1 + c.box.x2) / 2, cy = (c.box.y1 + c.box.y2) / 2, mine = Math.hypot(cx - e.lx, cy - e.ly);
+        if (ends.some(o => o !== e && Math.hypot(cx - o.lx, cy - o.ly) < mine - 4)) c.pref += 300;
+      });
+      out.ports.push(Object.assign({ e, t }, pick(cands, e.i)));
+    });
+    return out;
+  }
+  function renderTopo() {
+    const net = G.net, p = G.p, L = layoutMap(net, p); let s = '';
+    L.nets.forEach(l => { s += `<text class="c-net" x="${l.x}" y="${l.y}" text-anchor="middle">${esc(l.t)}</text>`; });
+    net.links.forEach((l, i) => {
+      const A = net.devices[l.a], B = net.devices[l.b];
+      const up = net.linkUp(i) && net.status(l.a, l.ai).protocol === 'up';
+      s += `<line class="c-link c-${cableType(net, l)}${up ? '' : ' is-down'}" x1="${A.x}" y1="${A.y}" x2="${B.x}" y2="${B.y}"/>`;
+    });
+    L.ports.forEach(pl => {
+      const e = pl.e, st = net.status(e.dn, e.ifn);
+      s += `<circle class="c-led ${st.protocol === 'up' ? 'is-up' : 'is-down'}" cx="${e.lx.toFixed(1)}" cy="${e.ly.toFixed(1)}" r="6"><title>${esc(e.dn + ' ' + e.ifn + ': ' + st.status + '/' + st.protocol)}</title></circle>`;
+      s += `<text class="c-port" x="${pl.x.toFixed(1)}" y="${pl.y.toFixed(1)}" text-anchor="${pl.anchor}">${esc(pl.t)}</text>`;
+    });
     Object.keys(net.devices).forEach(n => {
-      const d = net.devices[n], g = GLYPH[d.type], host = HOSTS.indexOf(d.type) >= 0;
-      const sub = host ? (d.ip || 'no IP') : (d.role || '');
-      const tw = Math.round(n.length * 7.7 + 16);
+      const d = net.devices[n], g = GLYPH[d.type], tw = tapeW(n), sub = L.subs[n];
+      const hx = Math.max(g.w, tw / 2) + 6, top = Math.min(-g.h - 10, sub ? sub.box.y1 - d.y - 4 : 0), bot = Math.max(g.tape + 24, sub ? sub.box.y2 - d.y + 4 : 0);
       s += `<g class="dev${n === G.active ? ' is-sel' : ''}" data-dev="${esc(n)}" transform="translate(${d.x},${d.y})" tabindex="0" role="button" aria-label="Open the console on ${esc(n)}">` +
-        `<rect class="g-hit" x="${-Math.max(g.w, tw / 2) - 6}" y="${-g.h - 10}" width="${Math.max(g.w, tw / 2) * 2 + 12}" height="${g.h + g.tape + 48}"/>` +
+        `<rect class="g-hit" x="${-hx}" y="${top}" width="${hx * 2}" height="${bot - top}"/>` +
         brackets(g.w, g.h) + g.svg +
         `<rect class="g-tape-shadow" x="${-tw / 2}" y="${g.tape + 1.5}" width="${tw}" height="20" rx="1.5"/><rect class="g-tape" x="${-tw / 2}" y="${g.tape}" width="${tw}" height="20" rx="1.5"/>` +
         `<text class="g-name" y="${g.tape + 14.5}" text-anchor="middle">${esc(n)}</text>` +
-        (sub ? `<text class="g-sub" y="${g.tape + 36}" text-anchor="middle">${esc(sub)}</text>` : '') + '</g>';
+        (sub ? `<text class="g-sub" x="${sub.dx}" y="${sub.dy}" text-anchor="${sub.anchor}">${esc(sub.t)}</text>` : '') + '</g>';
     });
     $('#topo-static').innerHTML = s;
   }
@@ -523,6 +620,7 @@
     } catch (err) { if (G === g) renderPost('error', err.message); }
   }
 
+  // Views: 'all' (every day), 'd2' (one day's outages), 'p7' (one outage).
   const BOARD = { view: 'all', data: null, err: null };
   function showBoard() {
     stopTimer(); G = null;
@@ -534,40 +632,57 @@
     try { BOARD.data = await api(); } catch (e) { BOARD.err = e.message; }
     renderBoard();
   }
+  const viewDay = v => v[0] === 'd' ? +v.slice(1) : v[0] === 'p' ? (PUZ.find(p => p.id === v) || {}).day : null;
   function renderBoardTabs() {
-    const tabs = [['all', '<b>All</b>outages']].concat(PUZ.map(p => [p.id, `<b>${p.num}</b>${esc(p.title)}`]));
-    $('#board-tabs').innerHTML = tabs.map(([id, label]) => `<button class="btab" type="button" role="tab" aria-selected="${BOARD.view === id}" data-view="${id}">${label}</button>`).join('');
+    const v = BOARD.view, day = viewDay(v);
+    const btn = (id, label, sel) => `<button class="btab" type="button" role="tab" aria-selected="${sel}" data-view="${id}">${label}</button>`;
+    let html = '<div class="btabs-row">' + btn('all', '<b>All</b>days', v === 'all') + DAYLIST.map(d => btn('d' + d, `<b>Day ${d}</b>${esc(dayDate(d, { day: 'numeric', month: 'short' }))}`, day === d)).join('') + '</div>';
+    if (day) html += '<div class="btabs-row btabs-sub">' + btn('d' + day, 'Whole day', v === 'd' + day) + dayPuz(day).map((p, k) => btn(p.id, `<b>${k + 1}</b>${esc(p.title)}`, v === p.id)).join('') + '</div>';
+    $('#board-tabs').innerHTML = html;
     $('#board-tabs').querySelectorAll('.btab').forEach(b => { b.onclick = () => { BOARD.view = b.getAttribute('data-view'); renderBoardTabs(); renderBoard(); }; });
   }
   const cmpRun = (a, b) => (a.time - b.time) || (a.escalations - b.escalations) || (a.commands - b.commands);
   const escWord = n => n ? ESC[n - 1][1].replace(' engineer', '') : 'No help';
   const escCell = n => `<span class="esc-dots" aria-hidden="true">${[1, 2, 3].map(i => `<i class="led ${i <= n ? 'led-a' : ''}"></i>`).join('')}</span>${escWord(n)}`;
   const when = iso => { try { return new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }); } catch (e) { return ''; } };
+  const sum = (runs, k) => runs.reduce((a, r) => a + r[k], 0);
+  function totals(p, list) { const runs = list.map(z => p.runs[z.id]).filter(Boolean); return { p, fixed: runs.length, total: sum(runs, 'time'), cmds: sum(runs, 'commands'), esc: sum(runs, 'escalations') }; }
+  const byTotals = (a, b) => (b.fixed - a.fixed) || (a.total - b.total) || (a.esc - b.esc) || (a.cmds - b.cmds);
   function renderBoard() {
     const body = $('#board-body');
     if (BOARD.err) { body.innerHTML = `<div class="board-empty"><b>Couldn’t load the leaderboard.</b><span>${esc(BOARD.err)} Press Refresh to try again.</span></div>`; return; }
     if (!BOARD.data) { body.innerHTML = '<div class="board-empty"><span>Loading the leaderboard…</span></div>'; return; }
-    const me = ME && ME.id;
+    const me = ME && ME.id, v = BOARD.view;
     const youTag = p => p.id === me ? '<span class="you-tag">You</span>' : '';
-    const players = (BOARD.data.players || []).filter(p => p.runs && Object.keys(p.runs).length);
-    if (BOARD.view === 'all') {
-      if (!players.length) { body.innerHTML = '<div class="board-empty"><b>No runs posted yet.</b><span>Fix an outage and post your time to take first place.</span></div>'; return; }
-      const rows = players.map(p => {
-        const runs = PUZ.map(z => p.runs[z.id]).filter(Boolean);
-        return { p, fixed: runs.length, total: runs.reduce((s, r) => s + r.time, 0), cmds: runs.reduce((s, r) => s + r.commands, 0), esc: runs.reduce((s, r) => s + r.escalations, 0) };
-      }).sort((a, b) => (b.fixed - a.fixed) || (a.total - b.total) || (a.esc - b.esc) || (a.cmds - b.cmds));
-      body.innerHTML = `<table class="lb"><thead><tr><th>#</th><th>Player</th><th>Fixed</th><th>Total time</th>${PUZ.map(z => `<th><small>${z.num}</small>${esc(z.title)}</th>`).join('')}</tr></thead><tbody>` +
-        rows.map((r, i) => `<tr class="${r.p.id === me ? 'you' : ''}"><td class="pos">${i + 1}</td><td class="who">${esc(r.p.name)}${youTag(r.p)}</td><td class="num">${r.fixed}/${PUZ.length}</td>` +
-          `<td><span class="t">${fmtTime(r.total)}</span><small class="sub">${r.cmds} commands, ${r.esc} escalation${r.esc === 1 ? '' : 's'}</small></td>` +
-          PUZ.map(z => { const x = r.p.runs[z.id]; return x ? `<td class="cell"><span class="t">${fmtTime(x.time)}</span><small>${x.commands} cmds, ${escWord(x.escalations).toLowerCase()}</small></td>` : '<td class="none">—</td>'; }).join('') + '</tr>').join('') +
+    const rowStart = (p, i) => `<tr class="${p.id === me ? 'you' : ''}"><td class="pos">${i + 1}</td><td class="who">${esc(p.name)}${youTag(p)}</td>`;
+    const totalCell = r => `<td><span class="t">${fmtTime(r.total)}</span><small class="sub">${r.cmds} commands, ${r.esc} escalation${r.esc === 1 ? '' : 's'}</small></td>`;
+    const players = (BOARD.data.players || []).filter(p => p.runs && PUZ.some(z => p.runs[z.id]));
+    const empty = (b, t) => { body.innerHTML = `<div class="board-empty"><b>${b}</b><span>${t}</span></div>`; };
+    if (v === 'all') {
+      if (!players.length) return empty('No runs posted yet.', 'Fix an outage and post your time to take first place.');
+      const rows = players.map(p => totals(p, PUZ)).sort(byTotals);
+      body.innerHTML = `<table class="lb"><thead><tr><th>#</th><th>Player</th><th>Fixed</th><th>Total time</th>${DAYLIST.map(d => `<th><small>Day ${d}</small>${esc(dayDate(d, { day: 'numeric', month: 'short' }))}</th>`).join('')}</tr></thead><tbody>` +
+        rows.map((r, i) => rowStart(r.p, i) + `<td class="num">${r.fixed}/${PUZ.length}</td>` + totalCell(r) +
+          DAYLIST.map(d => { const x = totals(r.p, dayPuz(d)); return x.fixed ? `<td class="cell"><span class="t">${fmtTime(x.total)}</span><small>${x.fixed}/${dayPuz(d).length} fixed</small></td>` : '<td class="none">—</td>'; }).join('') + '</tr>').join('') +
         '</tbody></table>';
       return;
     }
-    const z = PUZ.find(q => q.id === BOARD.view);
+    if (v[0] === 'd') {
+      const d = +v.slice(1), list = dayPuz(d), ps = players.filter(p => list.some(z => p.runs[z.id]));
+      if (!ps.length) return empty(`Nobody has posted a Day ${d} run yet.`, 'Fix one of its outages and take first place.');
+      const rows = ps.map(p => totals(p, list)).sort(byTotals);
+      body.innerHTML = `<table class="lb"><thead><tr><th>#</th><th>Player</th><th>Fixed</th><th>Total time</th>${list.map((z, k) => `<th><small>${k + 1}</small>${esc(z.title)}</th>`).join('')}</tr></thead><tbody>` +
+        rows.map((r, i) => rowStart(r.p, i) + `<td class="num">${r.fixed}/${list.length}</td>` + totalCell(r) +
+          list.map(z => { const x = r.p.runs[z.id]; return x ? `<td class="cell"><span class="t">${fmtTime(x.time)}</span><small>${x.commands} cmds, ${escWord(x.escalations).toLowerCase()}</small></td>` : '<td class="none">—</td>'; }).join('') + '</tr>').join('') +
+        '</tbody></table>';
+      return;
+    }
+    const z = PUZ.find(q => q.id === v);
+    if (!z) { BOARD.view = 'all'; renderBoardTabs(); renderBoard(); return; }
     const rows = players.filter(p => p.runs[z.id]).map(p => ({ p, r: p.runs[z.id] })).sort((a, b) => cmpRun(a.r, b.r));
-    if (!rows.length) { body.innerHTML = `<div class="board-empty"><b>Nobody has fixed ${esc(z.title)} yet.</b><span>Patch into port ${z.num} and be the first.</span></div>`; return; }
+    if (!rows.length) return empty(`Nobody has fixed ${esc(z.title)} yet.`, `Patch into Day ${z.day}, port ${portOf(z)} and be the first.`);
     body.innerHTML = '<table class="lb"><thead><tr><th>#</th><th>Player</th><th>Time</th><th>Commands</th><th>Escalations</th><th>Tests</th><th>Plays</th><th>Posted</th></tr></thead><tbody>' +
-      rows.map((x, i) => `<tr class="${x.p.id === me ? 'you' : ''}"><td class="pos">${i + 1}</td><td class="who">${esc(x.p.name)}${youTag(x.p)}</td><td class="t">${fmtTime(x.r.time)}</td><td class="num">${x.r.commands}</td><td>${escCell(x.r.escalations)}</td><td class="num">${x.r.tests}</td><td class="num">${x.r.plays || 1}</td><td>${when(x.r.at)}</td></tr>`).join('') +
+      rows.map((x, i) => rowStart(x.p, i) + `<td class="t">${fmtTime(x.r.time)}</td><td class="num">${x.r.commands}</td><td>${escCell(x.r.escalations)}</td><td class="num">${x.r.tests}</td><td class="num">${x.r.plays || 1}</td><td>${when(x.r.at)}</td></tr>`).join('') +
       '</tbody></table>';
   }
   $('#board-refresh').onclick = loadBoard;
