@@ -19,8 +19,9 @@ const favicon = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://w
 const head = [
   '<!doctype html>', '<html lang="en">', '<head>', '<meta charset="utf-8">',
   '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">',
-  '<meta property="og:title" content="Outage">',
-  '<meta property="og:description" content="Something’s down. Find the fault from the console, fix it, and prove it with a ping.">',
+  '<meta property="og:title" content="Outage: daily network engineering puzzles">',
+  '<meta property="og:description" content="Something’s down. Daily network engineering puzzles: find the fault from a Cisco-style console, fix it, and prove it with a ping.">',
+  '<meta name="twitter:card" content="summary">',
   '<meta property="og:type" content="website">',
   '<meta name="theme-color" content="#17212C">',
   `<link rel="icon" href="${favicon}">`,

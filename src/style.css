@@ -164,12 +164,13 @@ code { font-family: var(--f-mono); font-size: 0.86em; background: var(--term); c
 .home-grid { display: grid; gap: 28px; padding-top: 36px; grid-template-columns: minmax(0, 1fr); grid-template-areas: "hud" "panel" "detail" "demo"; }
 @media (min-width: 980px) { .home-grid { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); column-gap: 44px; grid-template-areas: "hud demo" "panel panel" "detail detail"; align-items: end; } }
 .hud { grid-area: hud; min-width: 0; }
-.eyebrow { margin: 0 0 14px; font: 500 12px/1 var(--f-mono); letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-2); }
+.eyebrow { margin: 0 0 14px; font: 500 12px/1.4 var(--f-mono); letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-2); }
 .hud h1 { margin: 0; font-family: var(--f-display); font-stretch: 62%; font-weight: 800; font-size: clamp(64px, 9vw, 124px); line-height: 0.86; letter-spacing: 0.01em; hyphens: none; }
 .fallback-type .hud h1 { font-size: clamp(44px, 7vw, 92px); }
 .stop { color: var(--led-r); }
 .hud.all-up .stop { color: var(--led-g); }
-.lede { max-width: 50ch; font-size: 18px; line-height: 1.5; color: var(--ink-2); margin: 22px 0 0; }
+.kicker { margin: 20px 0 0; font-size: clamp(22px, 2.3vw, 28px); font-weight: 700; font-stretch: 90%; line-height: 1.15; letter-spacing: -0.005em; color: var(--ink); }
+.lede { max-width: 50ch; font-size: 18px; line-height: 1.5; color: var(--ink-2); margin: 12px 0 0; }
 .lede strong { color: var(--ink); font-weight: 700; }
 .detail { grid-area: detail; background: var(--paper); border-radius: 6px; padding: 24px 26px 26px; border: 1px solid var(--rule); display: grid; gap: 18px 40px; min-width: 0; }
 @media (min-width: 760px) { .detail { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); align-items: center; } }
