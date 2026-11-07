@@ -142,6 +142,20 @@
     </div>
     <p class="board-note">Ranked by fastest time, then fewest escalations, then fewest commands. Each player&rsquo;s best run per outage counts.</p>
   </section>
+
+  <section id="statpage" class="wrap" hidden>
+    <div class="board-head">
+      <div class="hud board-hud">
+        <p class="eyebrow">Anonymous, counted in Brisbane time</p>
+        <h1>Players<span class="stop">.</span></h1>
+      </div>
+      <div class="board-actions">
+        <button class="btn btn-quiet" id="stats-refresh" type="button">Refresh</button>
+        <button class="btn btn-go" id="stats-home" type="button">Back to the panel</button>
+      </div>
+    </div>
+    <div id="stats-body" aria-live="polite"></div>
+  </section>
 </main>
 
 <div class="overlay" id="overlay" hidden>

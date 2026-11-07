@@ -15,7 +15,7 @@ function setup(p) {
   });
   return { net, sh, logs, run: (dev, ...cmds) => cmds.map(c => sh[dev].exec(c)) };
 }
-const objOk = (net, p) => p.objectives.map(o => net.ping(o.from, o.to, { silent: true }).ok);
+const objOk = (net, p) => p.objectives.map(o => net.passes(o, net.test(o, true)));
 const text = res => res.lines.map(l => l.s).join('\n');
 
 // ---------- each puzzle: broken at start, fixed after the intended commands ----------
@@ -29,7 +29,17 @@ const FIXES = {
   p7: s => s.run('R1', 'en', 'conf t', 'int g0/1', 'no ip address', 'int g0/2', 'ip address 192.168.40.1 255.255.255.0'),
   p8: s => s.run('SW1', 'en', 'conf t', 'int g0/1', 'switchport trunk native vlan 1'),
   p9: s => s.run('R1', 'en', 'conf t', 'interface g0/0.20', 'encapsulation dot1Q 20'),
-  p10: s => s.run('R1', 'en', 'conf t', 'no ip route 172.16.50.128 255.255.255.128 10.0.0.3')
+  p10: s => s.run('R1', 'en', 'conf t', 'no ip route 172.16.50.128 255.255.255.128 10.0.0.3'),
+  p11: s => s.run('SW1', 'en', 'conf t', 'int fa0/6', 'speed auto', 'duplex auto'),
+  p12: s => s.run('R2', 'en', 'conf t', 'int g0/1', 'ip address 10.0.0.2 255.255.255.252'),
+  p13: s => s.run('SW1', 'en', 'conf t', 'int fa0/3', 'no switchport port-security mac-address sticky 54bf.6403.91e2', 'shutdown', 'no shutdown'),
+  p14: s => s.run('SW2', 'en', 'conf t', 'int g0/1', 'switchport mode trunk'),
+  p15: s => s.run('R2', 'en', 'conf t', 'no ip route 172.16.30.0 255.255.255.0 10.0.12.1', 'ip route 172.16.30.0 255.255.255.0 10.0.23.2'),
+  p16: s => s.run('SW1', 'en', 'conf t', 'int fa0/5', 'no spanning-tree portfast', 'spanning-tree bpduguard disable', 'shutdown', 'no shutdown'),
+  p17: s => s.run('R1', 'en', 'conf t', 'access-list 10 permit 192.168.20.0 0.0.0.255'),
+  p18: s => s.run('R1', 'en', 'conf t', 'access-list 110 permit tcp any host 10.20.0.10 eq www'),
+  p19: s => s.run('R1', 'en', 'conf t', 'ip access-list extended GUEST-IN', 'no 20', '5 permit ip 192.168.50.0 0.0.0.255 host 10.30.0.40'),
+  p20: s => s.run('R1', 'en', 'conf t', 'no access-list 15', 'access-list 15 permit 192.168.99.0 0.0.0.255')
 };
 const P = id => PUZ.find(p => p.id === id);
 PUZ.forEach(p => {
@@ -149,6 +159,141 @@ t('p10 longest match: /25 wins for .200, /24 for .10', () => {
 t('p10 alt: re-pointing the /25 at R2 also works', () => {
   const s = setup(P('p10')); s.run('R1', 'en', 'conf t', 'no ip route 172.16.50.128 255.255.255.128 10.0.0.3', 'ip route 172.16.50.128 255.255.255.128 10.0.0.2');
   assert.ok(objOk(s.net, P('p10')).every(Boolean));
+});
+
+// ---------- Day 3 ----------
+const pcRun = (s, dev, line) => text(s.sh[dev].exec(line));
+t('p11 duplex mismatch: replies come back but some are lost; CRC on the full-duplex side', () => {
+  const s = setup(P('p11')); const r = s.net.ping('Accounts-PC', '192.168.20.10');
+  assert.ok(r.ok && r.lossy);
+  assert.ok(/Request timed out[\s\S]*Lost = 1 \(25% loss\)/.test(pcRun(s, 'Accounts-PC', 'ping 192.168.20.10')));
+  s.run('SW1', 'en');
+  assert.ok(/Fa0\/6\s+File server\s+connected\s+20\s+full\s+100/.test(text(s.sh.SW1.exec('show interfaces status'))));
+  const si = text(s.sh.SW1.exec('show interfaces fa0/6'));
+  assert.ok(/Full-duplex, 100Mb\/s/.test(si) && /[1-9]\d* CRC/.test(si), si);
+  assert.ok(/a-full\s+a-100/.test(text(s.sh.SW1.exec('show interfaces status')).split('\n').find(l => /^Fa0\/1 /.test(l))));
+});
+t('p11 alt: half duplex on both ends also stops the loss', () => { const s = setup(P('p11')); s.run('SW1', 'en', 'conf t', 'int fa0/6', 'duplex half'); assert.ok(objOk(s.net, P('p11')).every(Boolean)); });
+t('p11 mismatched fixed speeds bring the link down', () => {
+  const s = setup(P('p11')); const r = s.run('SW1', 'en', 'conf t', 'int fa0/6', 'speed 10');
+  assert.strictEqual(s.net.status('SW1', 'FastEthernet0/6').protocol, 'up', 'server is auto, so it follows');
+  s.net.devices['File-Server'].speed = '100'; s.net.touch();
+  assert.strictEqual(s.net.status('SW1', 'FastEthernet0/6').protocol, 'down');
+  assert.ok(/Invalid input/.test(text(s.sh.SW1.exec('speed 1000'))), 'Fast Ethernet has no 1000');
+});
+t('p12 /30 typo: R1 ARPs for .2 in vain; R2 has no default route installed', () => {
+  const s = setup(P('p12')); const r = s.net.ping('HQ-PC', '192.168.60.20');
+  assert.strictEqual(r.at, 'R1'); assert.strictEqual(r.kind, 'arp');
+  s.run('R2', 'en'); assert.ok(/Gateway of last resort is not set/.test(text(s.sh.R2.exec('show ip route'))));
+  assert.strictEqual(s.net.ping('Dock-PC', '192.168.1.20').kind, 'noroute');
+});
+t('p13 port security: err-disabled, clues, bounce alone re-violates', () => {
+  const s = setup(P('p13')); s.run('SW1', 'en');
+  assert.ok(/Fa0\/3\s+Priya desk\s+err-disabled/.test(text(s.sh.SW1.exec('show interfaces status'))));
+  const pi = text(s.sh.SW1.exec('show port-security interface fa0/3'));
+  assert.ok(/Secure-shutdown/.test(pi) && /Last Source Address:Vlan   : 54bf\.6411\.2a7c:10/.test(pi) && /Sticky MAC Addresses       : 1/.test(pi), pi);
+  assert.ok(/54-BF-64-11-2A-7C/.test(pcRun(s, 'Priya-Laptop', 'ipconfig /all')));
+  assert.ok(/10\s+54bf\.6403\.91e2\s+SecureSticky\s+Fa0\/3/.test(text(s.sh.SW1.exec('show port-security address'))));
+  const r = s.run('SW1', 'conf t', 'int fa0/3', 'shutdown', 'no shutdown');
+  assert.ok(/PSECURE_VIOLATION/.test(text(r[3])), text(r[3]));
+  assert.strictEqual(s.net.status('SW1', 'FastEthernet0/3').errdis, 'psecure-violation');
+  assert.ok(/switchport port-security mac-address sticky 54bf\.6403\.91e2/.test(text(s.sh.SW1.exec('do show run'))));
+});
+t('p13 no shutdown alone does nothing on an err-disabled port', () => {
+  const s = setup(P('p13')); const r = s.run('SW1', 'en', 'conf t', 'int fa0/3', 'no switchport port-security mac-address sticky 54bf.6403.91e2', 'no shutdown');
+  assert.strictEqual(s.net.status('SW1', 'FastEthernet0/3').errdis, 'psecure-violation');
+});
+t('p13 after the fix the new MAC is learned sticky', () => {
+  const s = setup(P('p13')); FIXES.p13(s);
+  assert.ok(/sticky 54bf\.6411\.2a7c/.test(text(s.sh.SW1.exec('do show run'))));
+});
+t('p13 alt: clear port-security sticky, then bounce; or raise the maximum', () => {
+  let s = setup(P('p13')); s.run('SW1', 'en', 'clear port-security sticky interface fa0/3', 'conf t', 'int fa0/3', 'sh', 'no sh'); assert.ok(objOk(s.net, P('p13')).every(Boolean));
+  s = setup(P('p13')); s.run('SW1', 'en', 'conf t', 'int fa0/3', 'switchport port-security maximum 2', 'sh', 'no sh'); assert.ok(objOk(s.net, P('p13')).every(Boolean));
+});
+t('p14 DTP auto/auto: no trunk, link acts as access VLAN 1', () => {
+  const s = setup(P('p14')); s.run('SW2', 'en');
+  assert.strictEqual(text(s.sh.SW2.exec('show interfaces trunk')), '');
+  const sp = text(s.sh.SW2.exec('show interfaces switchport'));
+  assert.ok(/Name: Gi0\/1\nSwitchport: Enabled\nAdministrative Mode: dynamic auto\nOperational Mode: static access/.test(sp), sp);
+  assert.ok(/^1\s+default\s+active\s+.*Gi0\/1/m.test(text(s.sh.SW2.exec('show vlan brief'))));
+});
+t('p14 alt: dynamic desirable on either side forms the trunk', () => {
+  const s = setup(P('p14')); s.run('SW1', 'en', 'conf t', 'int g0/1', 'switchport mode dynamic desirable');
+  assert.ok(objOk(s.net, P('p14')).every(Boolean));
+  assert.ok(/Gi0\/1\s+desirable\s+802\.1q\s+trunking\s+1/.test(text(s.sh.SW1.exec('do show interfaces trunk'))));
+});
+t('p15 loop: TTL expires, tracert alternates, PC sees TTL expired in transit', () => {
+  const s = setup(P('p15')); const r = s.net.ping('HQ-PC', '172.16.30.20');
+  assert.strictEqual(r.kind, 'ttl');
+  const tr = s.net.tracert('HQ-PC', '172.16.30.20').rows;
+  assert.deepStrictEqual(tr.slice(0, 4), ['192.168.1.1', '10.0.12.2', '10.0.12.1', '10.0.12.2']);
+  assert.ok(/Reply from 10\.0\.12\.\d: TTL expired in transit\./.test(pcRun(s, 'HQ-PC', 'ping 172.16.30.20')));
+  s.run('R1', 'en'); assert.ok(/&&&&&/.test(text(s.sh.R1.exec('ping 172.16.30.20'))));
+});
+
+// ---------- Day 4 ----------
+t('p16 BPDU guard: bounce alone re-err-disables; disabling the guard fixes it', () => {
+  const s = setup(P('p16')); const r = s.run('SW1', 'en', 'conf t', 'int fa0/5', 'shutdown', 'no shutdown');
+  assert.ok(/BLOCK_BPDUGUARD/.test(text(r[4])) && /err-disable state/.test(text(r[4])));
+  assert.ok(!objOk(s.net, P('p16'))[0]);
+  assert.ok(/portfast should only be enabled/.test(text(s.sh.SW1.exec('spanning-tree portfast'))));
+});
+t('p17 implicit deny; guests stay blocked; removing the ACL fails the guard', () => {
+  let s = setup(P('p17')); const r = s.net.ping('HR-PC', '10.10.10.20');
+  assert.strictEqual(r.kind, 'acl'); assert.strictEqual(r.at, 'R1');
+  assert.ok(/Reply from 192\.168\.20\.1: Destination host unreachable\./.test(pcRun(s, 'HR-PC', 'ping 10.10.10.20')));
+  s.run('R1', 'en');
+  assert.ok(/Outgoing access list is 10\n  Inbound  access list is not set/.test(text(s.sh.R1.exec('show ip interface g0/1'))));
+  assert.ok(/Standard IP access list 10\n    10 permit 192\.168\.10\.0, wildcard bits 0\.0\.0\.255/.test(text(s.sh.R1.exec('show access-lists'))));
+  s = setup(P('p17')); s.run('R1', 'en', 'conf t', 'int g0/1', 'no ip access-group 10 out'); assert.deepStrictEqual(objOk(s.net, P('p17')), [true, true, false]);
+});
+t('p17 match counters count real pings only', () => {
+  const s = setup(P('p17')); s.net.ping('Staff-PC', '10.10.10.20', { silent: true }); s.net.ping('Staff-PC', '10.10.10.20'); s.run('R1', 'en');
+  assert.ok(/0\.0\.0\.255 \(1 match\)/.test(text(s.sh.R1.exec('show access-lists'))));
+});
+t('p18 web blocked, ping allowed, SSH stays blocked; curl and tnc output', () => {
+  const s = setup(P('p18'));
+  assert.ok(s.net.ping('Staff-PC', '10.20.0.10').ok); assert.ok(!s.net.connect('Staff-PC', '10.20.0.10', 80).ok);
+  assert.ok(/curl: \(28\) Failed to connect to 10\.20\.0\.10 port 80/.test(pcRun(s, 'Staff-PC', 'curl http://10.20.0.10')));
+  FIXES.p18(s);
+  assert.ok(/<title>Intranet<\/title>/.test(pcRun(s, 'Staff-PC', 'curl http://10.20.0.10')));
+  assert.ok(/TcpTestSucceeded : False/.test(pcRun(s, 'Staff-PC', 'tnc 10.20.0.10 -port 22')));
+  s.run('R1', 'en'); assert.ok(/20 permit tcp any host 10\.20\.0\.10 eq www/.test(text(s.sh.R1.exec('show access-lists'))));
+  assert.ok(/access-list 110 permit icmp any any\naccess-list 110 permit tcp any host 10\.20\.0\.10 eq www/.test(text(s.sh.R1.exec('show run'))));
+});
+t('p18 lazy fix (permit ip any any) fails the SSH guard; closed port is refused', () => {
+  const s = setup(P('p18')); s.run('R1', 'en', 'conf t', 'access-list 110 permit ip any any'); assert.deepStrictEqual(objOk(s.net, P('p18')), [true, true, false]);
+  assert.strictEqual(s.net.connect('Staff-PC', '10.20.0.10', 443).stage, 'refused');
+  assert.ok(/Connection refused/.test(pcRun(s, 'Staff-PC', 'curl http://10.20.0.10:443')));
+});
+t('p19 named ACL: first match wins; sequence insert; prompt; duplicates', () => {
+  const s = setup(P('p19')); s.net.ping('Guest-Laptop', '10.30.0.40'); s.run('R1', 'en');
+  assert.ok(/10 deny ip 192\.168\.50\.0 0\.0\.0\.255 10\.30\.0\.0 0\.0\.0\.255 \(1 match\)/.test(text(s.sh.R1.exec('show access-lists'))));
+  const r = s.run('R1', 'conf t', 'ip access-list extended GUEST-IN');
+  assert.strictEqual(s.sh.R1.prompt(), 'R1(config-ext-nacl)#');
+  assert.ok(/Duplicate sequence/.test(text(s.sh.R1.exec('10 permit ip any any'))));
+  assert.ok(/Invalid input/.test(text(s.sh.R1.exec('permit ip 1.2.3.4 any'))), 'extended needs a wildcard or host');
+  s.sh.R1.exec('5 permit ip 192.168.50.0 0.0.0.255 host 10.30.0.40');
+  assert.ok(!/    5 permit/.test(text(s.sh.R1.exec('do show access-lists'))), 'a duplicate entry is ignored, as on IOS');
+  s.sh.R1.exec('no 20'); s.sh.R1.exec('5 permit ip 192.168.50.0 0.0.0.255 host 10.30.0.40');
+  assert.ok(/Extended IP access list GUEST-IN\n    5 permit ip 192\.168\.50\.0 0\.0\.0\.255 host 10\.30\.0\.40\n    10 deny/.test(text(s.sh.R1.exec('do show access-lists'))));
+});
+t('p19 alt: delete line 10 and re-add the deny lower down', () => {
+  const s = setup(P('p19')); s.run('R1', 'en', 'conf t', 'ip access-list extended GUEST-IN', 'no 10', '25 deny ip 192.168.50.0 0.0.0.255 10.30.0.0 0.0.0.255');
+  assert.ok(objOk(s.net, P('p19')).every(Boolean));
+});
+t('p20 wildcard typed as subnet mask is stored as 0.0.0.0/255.255.255.0', () => {
+  const s = setup(P('p20')); s.run('R1', 'en');
+  assert.ok(/10 permit 0\.0\.0\.0, wildcard bits 255\.255\.255\.0/.test(text(s.sh.R1.exec('show access-lists'))));
+  assert.ok(/access-list 15 permit 0\.0\.0\.0 255\.255\.255\.0/.test(text(s.sh.R1.exec('show run'))));
+  s.run('R1', 'conf t', 'no access-list 15', 'access-list 15 permit 192.168.10.5 255.255.255.0');
+  assert.ok(/permit 0\.0\.0\.5, wildcard bits 255\.255\.255\.0/.test(text(s.sh.R1.exec('do show access-lists'))), 'IOS applies the wildcard to the address');
+});
+t('p20 "no access-list 15 permit ..." deletes the whole list, which then permits all', () => {
+  const s = setup(P('p20')); s.run('R1', 'en', 'conf t', 'no access-list 15 permit 0.0.0.0 255.255.255.0');
+  assert.strictEqual(text(s.sh.R1.exec('do show access-lists')), '');
+  assert.deepStrictEqual(objOk(s.net, P('p20')), [true, true, false]);
 });
 
 // ---------- CLI behaviour ----------

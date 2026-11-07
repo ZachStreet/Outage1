@@ -20,6 +20,15 @@
   const ESC = [['Ask a colleague', 'Colleague'], ['Escalate to a senior engineer', 'Senior engineer'], ['Open a vendor support case', 'Vendor support']];
   const SITE = !!window.OUTAGE_SITE;
 
+  // ---------- anonymous play tracking (website version only) ----------
+  // A random visitor id stays in this browser. The server keeps a hash of it and per-day counts, nothing else.
+  const VKEY = 'outage-visitor-v1';
+  const VID = (() => { try { let v = localStorage.getItem(VKEY); if (!/^[a-f0-9]{32}$/.test(v || '')) { v = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''); localStorage.setItem(VKEY, v); } return v; } catch (e) { return null; } })();
+  function track(event, puzzle) {
+    if (!SITE || !VID || !/^https?:$/.test(location.protocol)) return;
+    try { fetch('/api/track', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ vid: VID, event, puzzle }), keepalive: true }).catch(() => {}); } catch (e) { /* offline */ }
+  }
+
   // ---------- leaderboard identity (website version only) ----------
   // A random private key stays in this browser; the server only ever shows a hash of it.
   const PKEY = 'outage-player-v1';
@@ -117,11 +126,11 @@
   function route() {
     const h = location.hash.slice(1), p = PUZ.find(x => x.id === h);
     $('#overlay').hidden = true;
-    if (p) openPuzzle(p); else if (h === 'leaderboard' && SITE) showBoard(); else showHome();
+    if (p) openPuzzle(p); else if (h === 'leaderboard' && SITE) showBoard(); else if (h === 'stats' && SITE) showStats(); else showHome();
   }
   function showHome() {
     stopTimer(); G = null;
-    $('#play').hidden = true; $('#board').hidden = true; $('#home').hidden = false; navCurrent(false);
+    $('#play').hidden = true; $('#board').hidden = true; $('#statpage').hidden = true; $('#home').hidden = false; navCurrent(false);
     const allFixed = PUZ.every(p => PR.solved[p.id]);
     setBrandLed(allFixed); setHudStatus(allFixed);
     renderPanel(true); renderDetail(); renderStats(); window.scrollTo(0, 0);
@@ -147,10 +156,12 @@
       }
       G.hist[n] = []; G.hi[n] = 0;
     });
-    $('#home').hidden = true; $('#board').hidden = true; $('#play').hidden = false; navCurrent(false);
+    $('#home').hidden = true; $('#board').hidden = true; $('#statpage').hidden = true; $('#play').hidden = false; navCurrent(false);
+    track('start', p.id);
     setBrandLed(false);
-    // Switches that disagree about a trunk's native VLAN have been logging it via CDP all along.
-    net.nativeMismatches().forEach(m => G.buf[m.dev].push(ln('sys', m.line), ln('sys', m.line), ln('dim', '')));
+    // Messages the devices logged before you arrived: the puzzle's own, plus CDP warnings that repeat every minute.
+    Object.keys(p.boot || {}).forEach(n => { p.boot[n].forEach(l => G.buf[n].push(ln('sys', l))); G.buf[n].push(ln('dim', '')); });
+    net.cdpWarnings().forEach(m => G.buf[m.dev].push(ln('sys', m.line), ln('sys', m.line), ln('dim', '')));
     G.cdpAt = 0;
     renderTicket(); renderTopo(); renderTabs(); renderPane(); renderStats();
     setStatus('', 'Press Test next to a test point to watch the packet, or pick a device and start investigating.');
@@ -172,7 +183,7 @@
   function tickStats() {
     if (!G) return;
     // CDP repeats the native VLAN complaint every minute until it's fixed.
-    if (!G.solved && elapsed() - G.cdpAt >= 60) { G.cdpAt = elapsed(); G.net.nativeMismatches().forEach(m => push(m.dev, [ln('sys', m.line)])); }
+    if (!G.solved && elapsed() - G.cdpAt >= 60) { G.cdpAt = elapsed(); G.net.cdpWarnings().forEach(m => push(m.dev, [ln('sys', m.line)])); }
     $('#st-time').textContent = fmtTime(elapsed());
     $('#st-cmds').textContent = G.cmds;
     $('#st-hints').textContent = G.hints + '/' + G.p.hints.length;
@@ -183,7 +194,7 @@
       const li = document.createElement('li');
       const led = o.state === 'pass' ? 'led-g' : o.state === 'fail' ? 'led-r' : '';
       const label = o.state === 'pass' ? 'Passing' : o.state === 'fail' ? 'Failing' : 'Not tested yet';
-      li.innerHTML = `<i class="led ${led}" aria-hidden="true"></i><span class="t-text">${esc(o.text)}<span class="sr"> (${label})</span><span class="t-cmd">${esc(o.from)}: ping ${esc(o.to)}</span></span><button class="push" type="button">Test</button>`;
+      li.innerHTML = `<i class="led ${led}" aria-hidden="true"></i><span class="t-text">${esc(o.text)}<span class="sr"> (${label})</span><span class="t-cmd">${esc(o.from)}: ${esc(testCmd(o))}${o.blocked ? ' <b>should fail</b>' : ''}</span></span><button class="push" type="button">Test</button>`;
       li.querySelector('button').onclick = () => testObjective(o);
       ul.appendChild(li);
     });
@@ -371,14 +382,20 @@
     if (r.ok) mark(from, 'mk-ok', '✓'); else mark(r.at, 'mk-bad', '×');
   }
   function describe(from, r) {
-    if (r.ok) return ['ok', `Reply from ${r.dst}. The round trip from ${from} to ${r.dstDev} and back works.`];
+    const what = r.port === 80 ? 'The web page loaded' : r.port ? `Port ${r.port} answered` : `Reply from ${r.dst}`;
+    if (r.ok && r.lossy) return ['bad', `Replies came back from ${r.dstDev}, but some were lost on the way. Something on the path is damaging packets.`];
+    if (r.ok) return ['ok', `${what}. The round trip from ${from} to ${r.dstDev} and back works.`];
+    if (r.stage === 'refused') return ['bad', `${r.dstDev} answered, but nothing on it is listening on port ${r.port}.`];
     if (r.stage === 'request') {
       if (r.kind === 'arp') return ['bad', `No reply. ${r.at} sent an ARP broadcast asking who has ${r.nh}, and nobody answered.`];
       if (r.kind === 'noroute') return ['bad', `Dropped at ${r.at}: it has no route to ${r.dst}.`];
+      if (r.kind === 'acl') return ['bad', `Dropped at ${r.at} by an access list.`];
       if (r.kind === 'nogw') return ['bad', `${r.at} has no default gateway, so it can’t send anything off its own subnet.`];
       if (r.kind === 'noip') return ['bad', `${r.at} has no IP address.`];
-      return ['bad', 'The packet looped until its TTL ran out.'];
+      const loop = Array.from(new Set(r.fwd.arrivals.slice(-4).map(a => a.dev)));
+      return ['bad', `The packet bounced between ${loop.join(' and ')} until its TTL ran out.`];
     }
+    if (r.kind === 'acl') return ['bad', `${r.dstDev} answered, but ${r.at} dropped the reply with an access list.`];
     return ['bad', `${r.dstDev} received the request, but its reply never made it back to ${from}.`];
   }
   function setStatus(tone, text) {
@@ -452,17 +469,21 @@
     tickStats();
   }
   function onPing(pg) {
-    const r = pg.res, o = G.obj.find(x => x.from === pg.from && x.to === pg.to);
-    if (o) { G.tries.push(r.ok); o.state = r.ok ? 'pass' : 'fail'; renderObjectives(); }
-    const [tone, text] = describe(pg.from, r);
+    const r = pg.res, o = G.obj.find(x => x.from === pg.from && x.to === pg.to && (x.port || null) === (pg.port || null));
+    const pass = o ? G.net.passes(o, r) : r.ok;
+    if (o) { G.tries.push(pass); o.state = pass ? 'pass' : 'fail'; renderObjectives(); }
+    let [tone, text] = describe(pg.from, r);
+    // A test point that should be blocked passes when the traffic is stopped.
+    if (o && o.blocked) { tone = pass ? 'ok' : 'bad'; text = pass ? 'Blocked, as it should be. ' + text : 'That got through, and it shouldn’t have. ' + text; }
     setStatus('busy', `Tracing ${pg.from} to ${pg.to}…`);
-    animate(pg.from, r).then(() => { if (!G) return; setStatus(tone, text); if (o && r.ok) checkWin(); });
+    animate(pg.from, r).then(() => { if (!G) return; setStatus(tone, text); if (o && pass) checkWin(); });
   }
+  const testCmd = o => o.port === 80 ? 'curl http://' + o.to : o.port ? `tnc ${o.to} -port ${o.port}` : 'ping ' + o.to;
   function testObjective(o) {
     if (G.solved) return;
     G.pcTab = 'cmd'; select(o.from, false);
     const sh = G.shells[o.from];
-    run((sh instanceof IOSShell && /^config/.test(sh.mode) ? 'do ping ' : 'ping ') + o.to);
+    run((sh instanceof IOSShell && /^config/.test(sh.mode) ? 'do ' : '') + testCmd(o));
     document.querySelector('.map').scrollIntoView({ block: 'nearest', behavior: RM ? 'auto' : 'smooth' });
   }
   function complete() { const sh = G.shells[G.active]; if (sh.complete) { const inp = $('#cli'); inp.value = sh.complete(inp.value); } focusInput(); }
@@ -515,16 +536,17 @@
 
   function checkWin() {
     if (G.solved || !G.obj.every(o => o.state === 'pass')) return;
-    const stale = G.obj.filter(o => !G.net.ping(o.from, o.to, { silent: true }).ok);
+    const stale = G.obj.filter(o => !G.net.passes(o, G.net.test(o, true)));
     if (stale.length) {
       stale.forEach(o => { o.state = 'fail'; }); renderObjectives();
-      setStatus('bad', `${stale[0].from} to ${stale[0].to} stopped working after a later change. Test it again.`);
+      setStatus('bad', `“${stale[0].text}” stopped passing after a later change. Test it again.`);
       return;
     }
     win();
   }
   function win() {
     G.solved = true; G.end = Date.now(); stopTimer(); tickStats();
+    track('fix', G.p.id);
     setBrandLed(true);
     const p = G.p, sec = elapsed(), fails = G.tries.filter(x => !x).length;
     const rank = rankFor(sec, G.hints), xp = xpFor(p, sec, G.hints, fails);
@@ -624,7 +646,7 @@
   const BOARD = { view: 'all', data: null, err: null };
   function showBoard() {
     stopTimer(); G = null;
-    $('#home').hidden = true; $('#play').hidden = true; $('#board').hidden = false;
+    $('#home').hidden = true; $('#play').hidden = true; $('#statpage').hidden = true; $('#board').hidden = false;
     navCurrent(true); setBrandLed(PUZ.every(p => PR.solved[p.id])); renderStats(); renderBoardTabs(); loadBoard(); window.scrollTo(0, 0);
   }
   async function loadBoard() {
@@ -685,6 +707,36 @@
       rows.map((x, i) => rowStart(x.p, i) + `<td class="t">${fmtTime(x.r.time)}</td><td class="num">${x.r.commands}</td><td>${escCell(x.r.escalations)}</td><td class="num">${x.r.tests}</td><td class="num">${x.r.plays || 1}</td><td>${when(x.r.at)}</td></tr>`).join('') +
       '</tbody></table>';
   }
+  // ---------- stats: who visits, who comes back (not linked; open #stats) ----------
+  function showStats() {
+    stopTimer(); G = null;
+    $('#home').hidden = true; $('#play').hidden = true; $('#board').hidden = true; $('#statpage').hidden = false;
+    navCurrent(false); loadStats(); window.scrollTo(0, 0);
+  }
+  async function loadStats() {
+    const body = $('#stats-body');
+    body.innerHTML = '<div class="board-card"><div class="board-empty"><span>Loading…</span></div></div>';
+    let s;
+    try {
+      const r = await fetch('/api/track', { cache: 'no-store' });
+      if (r.status === 404) throw new Error('The tracking service isn’t deployed on this site yet.');
+      if (!r.ok) throw new Error('The server said ' + r.status + '.');
+      s = await r.json();
+    } catch (e) { body.innerHTML = `<div class="board-card"><div class="board-empty"><b>Couldn’t load the stats.</b><span>${esc(e.message)}</span></div></div>`; return; }
+    const pct = (a, b) => b ? Math.round(a / b * 100) + '%' : '—';
+    const title = id => { const p = window.OUTAGE_PUZZLES.find(x => x.id === id); return p ? `Day ${p.day}, ${esc(p.title)}` : esc(id); };
+    body.innerHTML =
+      `<div class="stat-tiles"><div><span class="lcd">${s.visitors}</span><span class="rd-l">Visitors</span></div><div><span class="lcd">${s.returned}</span><span class="rd-l">Came back another day</span></div><div><span class="lcd">${pct(s.returned, s.visitors)}</span><span class="rd-l">Return rate</span></div></div>` +
+      '<h2 class="stats-h">By day</h2><div class="board-card"><div class="board-scroll"><table class="lb"><thead><tr><th>Date</th><th>Visitors</th><th>New</th><th>Returning</th><th>Outages started</th><th>Outages fixed</th></tr></thead><tbody>' +
+      (s.days.length ? s.days.map(d => `<tr><td>${esc(d.date)}</td><td class="num">${d.visitors}</td><td class="num">${d.new}</td><td class="num">${d.returning}</td><td class="num">${d.starts}</td><td class="num">${d.fixes}</td></tr>`).join('') : '<tr><td colspan="6">No visits yet.</td></tr>') +
+      '</tbody></table></div></div><h2 class="stats-h">By outage</h2><div class="board-card"><div class="board-scroll"><table class="lb"><thead><tr><th>Outage</th><th>Started</th><th>Fixed</th><th>Fix rate</th></tr></thead><tbody>' +
+      (s.puzzles.length ? s.puzzles.map(p => `<tr><td>${title(p.id)}</td><td class="num">${p.starts}</td><td class="num">${p.fixes}</td><td class="num">${pct(p.fixes, p.starts)}</td></tr>`).join('') : '<tr><td colspan="4">Nobody has opened an outage yet.</td></tr>') +
+      '</tbody></table></div></div><p class="board-note">Each browser counts as one visitor. “Came back another day” means it visited on at least two different days. Started and fixed count each outage once per visitor per day.</p>';
+  }
+  $('#stats-refresh').onclick = loadStats;
+  $('#stats-home').onclick = goHome;
+  track('visit');
+
   $('#board-refresh').onclick = loadBoard;
   $('#board-play').onclick = goHome;
 

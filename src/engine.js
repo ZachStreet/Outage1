@@ -47,7 +47,54 @@
     }
     return parts.join(',');
   }
-  const vlanAllowed = (port, v) => port.allowed === 'all' || port.allowed.indexOf(v) >= 0;
+  const vlanAllowed = (port, v) => !port.allowed || port.allowed === 'all' || port.allowed.indexOf(v) >= 0;
+
+  // MAC addresses: fixed per device and port, in Cisco's dotted form. Puzzles can set a host's MAC explicitly.
+  const hash32 = s => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+  const macFor = s => { const a = hash32(s), b = hash32(s + '#'); return [0x00, (a >>> 16) & 255, (a >>> 8) & 255, a & 255, (b >>> 8) & 255, b & 255].map(x => x.toString(16).padStart(2, '0')).join('').replace(/(....)(....)(....)/, '$1.$2.$3'); };
+  const winMac = m => m.replace(/\./g, '').toUpperCase().match(/../g).join('-');
+  const isMac = s => /^[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}$/i.test(s);
+  const cap = (name, ifn) => /^Gigabit/.test(ifn) ? 1000 : 100;
+
+  // ACL helpers. Addresses are stored the way IOS stores them: the address with the wildcard bits already applied.
+  const PORTS = { www: 80, telnet: 23, ftp: 21, smtp: 25, domain: 53, pop3: 110 };
+  const portName = n => { for (const k of Object.keys(PORTS)) if (PORTS[k] === n) return k; return String(n); };
+  const wildOk = (ip, a) => (((ip2n(ip) ^ ip2n(a.addr)) & ~ip2n(a.wc)) >>> 0) === 0;
+  const ANY = { addr: '0.0.0.0', wc: '255.255.255.255' };
+  const isAny = a => a.wc === '255.255.255.255';
+  function aclAddr(t, i, std) {
+    if (t[i] === 'any') return { addr: ANY.addr, wc: ANY.wc, next: i + 1 };
+    if (t[i] === 'host') return isIP(t[i + 1]) ? { addr: t[i + 1], wc: '0.0.0.0', next: i + 2 } : { err: i + 1 };
+    if (!isIP(t[i])) return { err: i };
+    if (isIP(t[i + 1])) { const wc = t[i + 1]; return { addr: n2ip((ip2n(t[i]) & ~ip2n(wc)) >>> 0), wc, next: i + 2 }; }
+    return std ? { addr: t[i], wc: '0.0.0.0', next: i + 1 } : { err: i + 1 };
+  }
+  // Parse the part of an ACL line after permit/deny. Returns an entry, or { err: index of the bad token }.
+  function parseAce(type, action, t) {
+    if (type === 'std') {
+      const a = aclAddr(t, 0, true);
+      if (a.err !== undefined) return { err: a.err };
+      if (a.next < t.length) return { err: a.next };
+      return { action, src: { addr: a.addr, wc: a.wc } };
+    }
+    const proto = (t[0] || '').toLowerCase();
+    if (['ip', 'icmp', 'tcp', 'udp'].indexOf(proto) < 0) return { err: 0 };
+    const sa = aclAddr(t, 1, false); if (sa.err !== undefined) return { err: sa.err };
+    const da = aclAddr(t, sa.next, false); if (da.err !== undefined) return { err: da.err };
+    let i = da.next, dport = null;
+    if (i < t.length) {
+      if (t[i].toLowerCase() !== 'eq' || (proto !== 'tcp' && proto !== 'udp')) return { err: i };
+      const pv = t[i + 1] && (PORTS[t[i + 1].toLowerCase()] || (/^\d+$/.test(t[i + 1]) && +t[i + 1] <= 65535 ? +t[i + 1] : 0));
+      if (!pv) return { err: i + 1 };
+      dport = pv; i += 2;
+      if (i < t.length) return { err: i };
+    }
+    return { action, proto, src: { addr: sa.addr, wc: sa.wc }, dst: { addr: da.addr, wc: da.wc }, dport };
+  }
+  const addrStd = a => isAny(a) ? 'any' : a.wc === '0.0.0.0' ? a.addr : a.addr + ', wildcard bits ' + a.wc;
+  const addrExt = a => isAny(a) ? 'any' : a.wc === '0.0.0.0' ? 'host ' + a.addr : a.addr + ' ' + a.wc;
+  const aceText = (type, e) => type === 'std' ? addrStd(e.src) : e.proto + ' ' + addrExt(e.src) + ' ' + addrExt(e.dst) + (e.dport ? ' eq ' + portName(e.dport) : '');
+  const aceRun = (type, e) => type === 'std' ? (isAny(e.src) ? 'any' : e.src.wc === '0.0.0.0' ? e.src.addr : e.src.addr + ' ' + e.src.wc) : aceText(type, e);
 
   // ---------- network model ----------
   class Network {
@@ -56,7 +103,9 @@
       this.links = def.links.map(l => Object.assign({}, l));
       this.arp = new Set();
       this.version = 0;
+      this.counting = false;
     }
+    mac(name, ifn) { const d = this.devices[name]; return this.isHost(name) ? (d.mac || macFor(name)) : macFor(name + '/' + parentIf(ifn || '')); }
     touch() { this.arp.clear(); this.version++; }
     isHost(name) { return HOSTS.indexOf(this.devices[name].type) >= 0; }
     isRouter(name) { return this.devices[name].type === 'router'; }
@@ -107,7 +156,22 @@
       }
       return null;
     }
-    linkUp(i) { const l = this.links[i]; return this.adminUp(l.a, l.ai) && this.adminUp(l.b, l.bi); }
+    // Up enough to pass frames: not shut down and not err-disabled.
+    portUp(name, ifn) { if (!this.adminUp(name, ifn)) return false; const c = this.ifaceCfg(name, parentIf(ifn)); return !(c && c.errdis); }
+    nic(name, ifn) { const c = this.isHost(name) ? this.devices[name] : this.ifaceCfg(name, parentIf(ifn)); return { speed: (c && c.speed) || 'auto', duplex: (c && c.duplex) || 'auto', cap: this.isHost(name) ? 100 : cap(name, ifn) }; }
+    // What the two ends of a cable settle on. Auto-negotiation only happens when both ends are fully auto; an end that
+    // can't negotiate still senses the speed but falls back to half duplex. Two different fixed speeds never link up.
+    linkMode(i) {
+      const l = this.links[i], A = this.nic(l.a, l.ai), B = this.nic(l.b, l.bi);
+      if (A.speed !== 'auto' && B.speed !== 'auto' && A.speed !== B.speed) return { ok: false };
+      const full = x => x.speed === 'auto' && x.duplex === 'auto', both = full(A) && full(B);
+      const dup = x => x.duplex !== 'auto' ? x.duplex : both ? 'full' : 'half';
+      const speed = A.speed !== 'auto' ? +A.speed : B.speed !== 'auto' ? +B.speed : Math.min(A.cap, B.cap);
+      return { ok: true, a: dup(A), b: dup(B), speed, autoA: A, autoB: B };
+    }
+    duplexMismatch(i) { const m = this.linkMode(i); return m.ok && m.a !== m.b; }
+    linkUp(i) { const l = this.links[i]; return this.portUp(l.a, l.ai) && this.portUp(l.b, l.bi) && this.linkMode(i).ok; }
+    endMode(name, ifn) { const p = this.peer(name, ifn); if (!p) return null; const m = this.linkMode(p.link), l = this.links[p.link]; if (!m.ok) return null; const mine = l.a === name && l.ai === parentIf(ifn); return { duplex: mine ? m.a : m.b, speed: m.speed }; }
     status(name, ifn) {
       if (isSub(ifn)) {
         const c = this.ifaceCfg(name, ifn);
@@ -116,8 +180,10 @@
         return ps.status === 'administratively down' ? { status: 'down', protocol: 'down' } : ps;
       }
       if (!this.adminUp(name, ifn)) return { status: 'administratively down', protocol: 'down' };
+      const c = this.ifaceCfg(name, ifn);
+      if (c && c.errdis) return { status: 'down', protocol: 'down', errdis: c.errdis };
       const p = this.peer(name, ifn);
-      if (!p || !this.adminUp(p.dev, p.ifn)) return { status: 'down', protocol: 'down' };
+      if (!p || !this.portUp(p.dev, p.ifn) || !this.linkMode(p.link).ok) return { status: 'down', protocol: 'down' };
       return { status: 'up', protocol: 'up' };
     }
     l3If(name, ifn) {
@@ -135,6 +201,48 @@
       if (this.isHost(name)) return d.ip === ip;
       if (d.type === 'router') return Object.keys(d.ifaces).some(n => d.ifaces[n].ip === ip && this.status(name, n).protocol === 'up');
       return false;
+    }
+
+    // DTP: trunk is always on, access never trunks, dynamic auto waits to be asked, dynamic desirable asks.
+    opTrunk(name, ifn) {
+      const c = this.devices[name].ports[ifn];
+      if (c.mode === 'trunk') return true;
+      if (!c.mode || c.mode === 'access') return false;
+      const p = this.peer(name, ifn);
+      if (!p || this.devices[p.dev].type !== 'switch') return false;
+      const o = this.devices[p.dev].ports[p.ifn].mode;
+      if (!o || o === 'access') return false;
+      return c.mode === 'dynamic desirable' || o === 'trunk' || o === 'dynamic desirable';
+    }
+    // Port security: is the device on this port allowed to use it?
+    psecAllowed(name, ifn) {
+      const ps = this.devices[name].ports[ifn].psec;
+      if (!ps || !ps.on) return true;
+      const p = this.peer(name, ifn);
+      if (!p || !this.isHost(p.dev)) return true;
+      const m = this.mac(p.dev), known = (ps.macs || []).concat(ps.dyn || []);
+      return known.indexOf(m) >= 0 || known.length < (ps.max || 1);
+    }
+    // Checks a switch port runs when it comes up. May err-disable it; returns the log lines.
+    portChecks(name, ifn) {
+      const c = this.devices[name].ports[ifn], p = this.peer(name, ifn), s = shortIf(ifn);
+      if (!p || !this.portUp(p.dev, p.ifn)) return [];
+      if (c.bpduguard && this.devices[p.dev].type === 'switch') {
+        c.errdis = 'bpduguard';
+        return [L('sys', '%SPANTREE-2-BLOCK_BPDUGUARD: Received BPDU on port ' + s + ' with BPDU Guard enabled. Disabling port.'), L('sys', '%PM-4-ERR_DISABLE: bpduguard error detected on ' + s + ', putting ' + s + ' in err-disable state')];
+      }
+      const ps = c.psec;
+      if (ps && ps.on && this.isHost(p.dev)) {
+        const m = this.mac(p.dev), known = (ps.macs || []).concat(ps.dyn || []);
+        if (known.indexOf(m) >= 0) return [];
+        if (known.length < (ps.max || 1)) { if (ps.sticky) (ps.macs = ps.macs || []).push(m); else (ps.dyn = ps.dyn || []).push(m); return []; }
+        ps.viol = (ps.viol || 0) + 1; ps.last = m;
+        if ((ps.violation || 'shutdown') === 'shutdown') {
+          c.errdis = 'psecure-violation';
+          return [L('sys', '%PM-4-ERR_DISABLE: psecure-violation error detected on ' + s + ', putting ' + s + ' in err-disable state'), L('sys', '%PORT_SECURITY-2-PSECURE_VIOLATION: Security violation occurred, caused by MAC address ' + m + ' on port ' + ifn + '.')];
+        }
+      }
+      return [];
     }
 
     // Layer 2: every L3 endpoint an untagged frame from (srcDev, srcIf) can reach, plus the links it crossed.
@@ -166,9 +274,11 @@
         }
         if (d.type !== 'switch') { if (!f.tagged) endpoints.push({ dev: p.dev, ifn: p.ifn, path }); continue; }
         const port = d.ports[p.ifn];
+        if (!this.psecAllowed(p.dev, p.ifn)) continue;
         let v;
-        if (port.mode === 'trunk') { v = f.tagged ? f.vlan : (port.native || 1); if (!vlanAllowed(port, v)) continue; }
-        else { if (f.tagged) continue; v = port.vlan; }
+        if (this.opTrunk(p.dev, p.ifn)) { v = f.tagged ? f.vlan : (port.native || 1); if (!vlanAllowed(port, v)) continue; }
+        else { if (f.tagged) continue; v = port.vlan || 1; }
+        hop.vlan = v;
         if (!d.vlans[v]) continue;
         const key = p.dev + '|' + v;
         if (seen.has(key)) continue;
@@ -176,11 +286,11 @@
         for (const out of Object.keys(d.ports)) {
           if (out === p.ifn) continue;
           const op = d.ports[out];
-          if (op.shutdown) continue;
-          if (op.mode === 'trunk') {
+          if (op.shutdown || op.errdis || !this.psecAllowed(p.dev, out)) continue;
+          if (this.opTrunk(p.dev, out)) {
             if (!vlanAllowed(op, v)) continue;
             q.push({ from: p.dev, fromIf: out, vlan: v, tagged: v !== (op.native || 1), path });
-          } else if (op.vlan === v) {
+          } else if ((op.vlan || 1) === v) {
             q.push({ from: p.dev, fromIf: out, vlan: v, tagged: false, path });
           }
         }
@@ -219,7 +329,7 @@
         const A = this.devices[l.a], B = this.devices[l.b];
         if (A.type !== 'switch' || B.type !== 'switch' || !this.linkUp(i)) return;
         const pa = A.ports[l.ai], pb = B.ports[l.bi];
-        if (pa.mode !== 'trunk' || pb.mode !== 'trunk') return;
+        if (!this.opTrunk(l.a, l.ai) || !this.opTrunk(l.b, l.bi)) return;
         const na = pa.native || 1, nb = pb.native || 1;
         if (na === nb) return;
         out.push({ dev: l.a, ifn: l.ai, native: na, peer: B.hostname || l.b, peerIf: l.bi, peerNative: nb });
@@ -228,13 +338,45 @@
       return out.map(m => Object.assign(m, { line: '%CDP-4-NATIVE_VLAN_MISMATCH: Native VLAN mismatch discovered on ' + m.ifn + ' (' + m.native + '), with ' + m.peer + ' ' + m.peerIf + ' (' + m.peerNative + ').' }));
     }
 
+    // Cisco devices at both ends of a link report duplex mismatches over CDP.
+    duplexWarnings() {
+      const out = [];
+      this.links.forEach((l, i) => {
+        if (this.isHost(l.a) || this.isHost(l.b) || !this.linkUp(i)) return;
+        const m = this.linkMode(i); if (m.a === m.b) return;
+        const A = this.devices[l.a], B = this.devices[l.b], say = x => x === 'half' ? 'half duplex' : 'not half duplex';
+        out.push({ dev: l.a, line: '%CDP-4-DUPLEX_MISMATCH: duplex mismatch discovered on ' + l.ai + ' (' + say(m.a) + '), with ' + (B.hostname || l.b) + ' ' + l.bi + ' (' + say(m.b) + ').' });
+        out.push({ dev: l.b, line: '%CDP-4-DUPLEX_MISMATCH: duplex mismatch discovered on ' + l.bi + ' (' + say(m.b) + '), with ' + (A.hostname || l.a) + ' ' + l.ai + ' (' + say(m.a) + ').' });
+      });
+      return out;
+    }
+    cdpWarnings() { return this.nativeMismatches().concat(this.duplexWarnings()); }
+
+    // Access lists. An ACL that is applied but doesn't exist filters nothing, like IOS.
+    aclEval(dev, name, pkt) {
+      const a = (this.devices[dev].acls || {})[name];
+      if (!a) return true;
+      for (const e of a.entries) {
+        const hit = wildOk(pkt.src, e.src) && (a.type === 'std' || ((e.proto === 'ip' || e.proto === pkt.proto) && wildOk(pkt.dst, e.dst) && (!e.dport || e.dport === pkt.dport)));
+        if (hit) { if (this.counting) e.hits = (e.hits || 0) + 1; return e.action === 'permit'; }
+      }
+      return false;
+    }
+
     // One-way packet walk from a device toward dst.
-    route(src, dst) {
+    // pk describes the packet: { proto: 'icmp' | 'tcp', dport, sport }.
+    route(src, dst, pk) {
+      pk = pk || {};
       const hops = [], arrivals = [], resolutions = [];
-      let cur = src, srcIP = null, ttl = 12;
-      const fail = (at, kind, nh) => ({ ok: false, hops, arrivals, resolutions, at, kind, nh: nh || null, srcIP });
+      let cur = src, srcIP = null, ttl = 12, inIf = null;
+      const fail = (at, kind, nh, extra) => Object.assign({ ok: false, hops, arrivals, resolutions, at, kind, nh: nh || null, srcIP }, extra || {});
+      const pkt = () => ({ src: srcIP, dst, proto: pk.proto || 'icmp', dport: pk.dport || null, sport: pk.sport || null });
       while (ttl-- > 0) {
         const d = this.devices[cur];
+        if (inIf && d.type === 'router') {
+          const acl = (d.ifaces[inIf] || {}).aclIn;
+          if (acl && !this.aclEval(cur, acl, pkt())) { arrivals.pop(); return fail(cur, 'acl', null, { acl, dir: 'in', ifn: inIf }); }
+        }
         if (this.owns(cur, dst)) return { ok: true, hops, arrivals, resolutions, dev: cur, srcIP };
         let egress, nh;
         if (this.isHost(cur)) {
@@ -249,30 +391,44 @@
           if (!r) return fail(cur, 'noroute');
           egress = r.ifn; nh = r.nh || dst;
           if (srcIP === null) srcIP = d.ifaces[egress].ip;
+          // Outbound ACLs don't filter traffic the router itself originates.
+          const acl = inIf && d.ifaces[egress].aclOut;
+          if (acl && !this.aclEval(cur, acl, pkt())) return fail(cur, 'acl', nh, { acl, dir: 'out', ifn: egress });
         } else return fail(cur, 'noroute');
         const dom = this.l2(cur, egress);
         const t = dom.endpoints.find(e => { const l3 = this.l3If(e.dev, e.ifn); return l3 && l3.ip === nh; });
         if (!t) { dom.edges.forEach(h => hops.push(Object.assign({ flood: true }, h))); return fail(cur, 'arp', nh); }
         resolutions.push(cur + '>' + nh);
         t.path.forEach(h => hops.push(h));
-        cur = t.dev;
+        cur = t.dev; inIf = t.ifn;
         if (this.isRouter(cur)) arrivals.push({ dev: cur, ip: this.l3If(t.dev, t.ifn).ip });
       }
       return fail(cur, 'ttl');
     }
 
-    // Round trip. silent=true leaves the ARP cache alone (used for win checks).
-    ping(src, dst, opts) {
+    // Round trip. silent=true leaves the ARP cache and ACL counters alone (used for win checks).
+    trip(src, dst, req, rep, port, opts) {
       const silent = !!(opts && opts.silent);
-      const f = this.route(src, dst);
-      if (!f.ok) return { ok: false, stage: 'request', kind: f.kind, at: f.at, nh: f.nh, dst, fwd: f, back: null, srcIP: f.srcIP };
-      if (f.dev === src) return { ok: true, stage: 'done', dst, dstDev: src, fwd: f, back: { ok: true, hops: [], arrivals: [], resolutions: [] }, srcIP: dst, arpMiss: false };
-      const b = this.route(f.dev, f.srcIP);
-      const ok = b.ok && b.dev === src;
-      const miss = ok && f.resolutions.some(k => !this.arp.has(k));
-      if (ok && !silent) f.resolutions.concat(b.resolutions).forEach(k => this.arp.add(k));
-      return { ok, stage: ok ? 'done' : 'reply', kind: ok ? null : b.kind, at: ok ? null : b.at, nh: b.nh, dst, dstDev: f.dev, fwd: f, back: b, srcIP: f.srcIP, arpMiss: miss };
+      this.counting = !silent;
+      try {
+        const f = this.route(src, dst, req);
+        if (!f.ok) return { ok: false, stage: 'request', kind: f.kind, at: f.at, nh: f.nh, acl: f.acl, dst, port, fwd: f, back: null, srcIP: f.srcIP };
+        if (f.dev === src) return { ok: true, stage: 'done', dst, port, dstDev: src, fwd: f, back: { ok: true, hops: [], arrivals: [], resolutions: [] }, srcIP: dst, arpMiss: false };
+        // TCP: nothing listening means the server answers with a reset, which still has to get back.
+        const refused = port && !(this.isHost(f.dev) && (this.devices[f.dev].services || []).indexOf(port) >= 0);
+        const b = this.route(f.dev, f.srcIP, rep);
+        const back = b.ok && b.dev === src, ok = back && !refused;
+        const miss = back && f.resolutions.some(k => !this.arp.has(k));
+        if (back && !silent) f.resolutions.concat(b.resolutions).forEach(k => this.arp.add(k));
+        const lossy = ok && f.hops.concat(b.hops).some(h => !h.flood && this.duplexMismatch(h.link));
+        return { ok, lossy, stage: ok ? 'done' : back ? 'refused' : 'reply', kind: back ? null : b.kind, at: back ? null : b.at, nh: b.nh, acl: b.acl, dst, port, dstDev: f.dev, fwd: f, back: b, srcIP: f.srcIP, arpMiss: miss };
+      } finally { this.counting = false; }
     }
+    ping(src, dst, opts) { return this.trip(src, dst, { proto: 'icmp' }, { proto: 'icmp' }, null, opts); }
+    connect(src, dst, port, opts) { return this.trip(src, dst, { proto: 'tcp', dport: port }, { proto: 'tcp', sport: port }, port, opts); }
+    // Test points: o = { from, to, port?, blocked?, dev? }.
+    test(o, silent) { return o.port ? this.connect(o.from, o.to, o.port, { silent }) : this.ping(o.from, o.to, { silent }); }
+    passes(o, r) { return o.blocked ? !r.ok : !!r.ok && !r.lossy && (!o.dev || r.dstDev === o.dev); }
 
     tracert(src, dst) {
       const f = this.route(src, dst), rows = [];
@@ -289,8 +445,8 @@
   }
 
   // ---------- IOS-style shell ----------
-  const MODES = { user: 'U', priv: 'P', config: 'C', 'config-if': 'I', 'config-vlan': 'V' };
-  const PARAMS = ['IP', 'MASK', 'IFACE', 'VLAN', 'VLANLIST', 'WORD', 'LINE'];
+  const MODES = { user: 'U', priv: 'P', config: 'C', 'config-if': 'I', 'config-vlan': 'V', 'config-std-nacl': 'A', 'config-ext-nacl': 'A' };
+  const PARAMS = ['IP', 'MASK', 'IFACE', 'VLAN', 'VLANLIST', 'WORD', 'LINE', 'NUM', 'ACLNUM', 'MAC'];
   const isParam = p => PARAMS.indexOf(p) >= 0;
   const KW_HELP = {
     enable: 'Turn on privileged commands', disable: 'Turn off privileged commands', configure: 'Enter configuration mode',
@@ -307,9 +463,19 @@
     description: 'Interface specific description', do: 'To run exec commands in config mode', write: 'Write running configuration to memory',
     memory: 'Write to NV memory', copy: 'Copy from one file to another', 'startup-config': 'Copy to startup configuration',
     encapsulation: 'Set encapsulation type for an interface', dot1q: 'IEEE 802.1Q Virtual LAN', cdp: 'CDP information',
-    neighbors: 'CDP neighbor entries'
+    neighbors: 'CDP neighbor entries', 'access-list': 'Add an access list entry', 'access-lists': 'List access lists',
+    'access-group': 'Specify access control for packets', permit: 'Specify packets to forward', deny: 'Specify packets to reject',
+    in: 'inbound packets', out: 'outbound packets', standard: 'Standard Access List', extended: 'Extended Access List',
+    'port-security': 'Security related command', maximum: 'Max secure addresses', 'mac-address': 'Secure mac address',
+    sticky: 'Configure dynamically learned MAC addresses as sticky', violation: 'Security violation mode',
+    protect: 'Security violation protect mode', restrict: 'Security violation restrict mode', 'spanning-tree': 'Spanning Tree Subsystem',
+    portfast: 'Portfast options for the interface', bpduguard: "Don't accept BPDUs on this interface", disable: 'Disable', clear: 'Reset functions',
+    speed: 'Configure speed operation.', duplex: 'Configure duplex operation.', full: 'Force full duplex operation', half: 'Force half-duplex operation',
+    auto: 'Enable AUTO speed configuration', dynamic: 'Set trunking mode to dynamically negotiate access or trunk mode',
+    desirable: 'Set trunking mode dynamic negotiation parameter to DESIRABLE', address: 'Show secure address', 'interface': 'Select an interface'
   };
-  const PARAM_SHOW = { IP: ['A.B.C.D', 'IP address'], MASK: ['A.B.C.D', 'IP subnet mask'], VLAN: ['<1-4094>', 'VLAN ID'], VLANLIST: ['WORD', 'VLAN IDs of the allowed VLANs, e.g. 10,20,30-40'], WORD: ['WORD', 'Name'], LINE: ['LINE', 'Text'] };
+  const PARAM_SHOW = { IP: ['A.B.C.D', 'IP address'], MASK: ['A.B.C.D', 'IP subnet mask'], VLAN: ['<1-4094>', 'VLAN ID'], VLANLIST: ['WORD', 'VLAN IDs of the allowed VLANs, e.g. 10,20,30-40'], WORD: ['WORD', 'Name'], LINE: ['LINE', 'Text'],
+    NUM: ['<1-2147483647>', 'Number'], ACLNUM: ['<1-199>', 'IP access list number (1-99 standard, 100-199 extended)'], MAC: ['H.H.H', '48 bit mac address'] };
 
   function tokenize(line) {
     const toks = [], re = /\S+/g; let m;
@@ -396,16 +562,109 @@
     { m: 'I', t: 'S', p: ['no', 'switchport', 'trunk', 'allowed', 'vlan'], f() { this.cfg().allowed = 'all'; this.net.touch(); } },
     { m: 'I', t: 'S', p: ['switchport', 'trunk', 'native', 'vlan', 'VLAN'], f(v) { this.cfg().native = v[0]; this.net.touch(); } },
     { m: 'I', t: 'S', p: ['no', 'switchport', 'trunk', 'native', 'vlan'], f() { this.cfg().native = 1; this.net.touch(); } },
-    { m: 'CIV', p: ['exit'], f() { this.mode = this.mode === 'config' ? 'priv' : 'config'; this.ifn = null; this.vlan = null; } },
-    { m: 'CIV', p: ['end'], f() { this.mode = 'priv'; this.ifn = null; this.vlan = null; return [L('sys', '%SYS-5-CONFIG_I: Configured from console by console')]; } },
-    { m: 'CIV', p: ['do', 'LINE'], f(v) { return this.execIn(v[0], 'priv'); } }
+    // ----- speed, duplex, DTP, spanning tree, port security -----
+    { m: 'I', p: ['speed', 'auto'], f() { this.cfg().speed = 'auto'; return this.relink(); } },
+    { m: 'I', p: ['speed', 'NUM'], f(v) {
+      if ([10, 100, 1000].indexOf(v[0]) < 0 || (v[0] === 1000 && cap(this.name, this.ifn) < 1000)) return this.caret(1);
+      this.cfg().speed = String(v[0]); return this.relink();
+    } },
+    { m: 'I', p: ['duplex', 'auto'], f() { this.cfg().duplex = 'auto'; return this.relink(); } },
+    { m: 'I', p: ['duplex', 'full'], f() { this.cfg().duplex = 'full'; return this.relink(); } },
+    { m: 'I', p: ['duplex', 'half'], f() { this.cfg().duplex = 'half'; return this.relink(); } },
+    { m: 'I', t: 'S', p: ['switchport', 'mode', 'dynamic', 'auto'], f() { this.cfg().mode = 'dynamic auto'; this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['switchport', 'mode', 'dynamic', 'desirable'], f() { this.cfg().mode = 'dynamic desirable'; this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['spanning-tree', 'portfast'], f() { this.cfg().portfast = true; return [L('out', '%Warning: portfast should only be enabled on ports connected to a single'), L('out', ' host. Connecting hubs, concentrators, switches, bridges, etc... to this'), L('out', ' interface  when portfast is enabled, can cause temporary bridging loops.'), L('out', ' Use with CAUTION')]; } },
+    { m: 'I', t: 'S', p: ['no', 'spanning-tree', 'portfast'], f() { this.cfg().portfast = false; } },
+    { m: 'I', t: 'S', p: ['spanning-tree', 'bpduguard', 'enable'], f() { this.cfg().bpduguard = true; } },
+    { m: 'I', t: 'S', p: ['spanning-tree', 'bpduguard', 'disable'], f() { this.cfg().bpduguard = false; } },
+    { m: 'I', t: 'S', p: ['no', 'spanning-tree', 'bpduguard'], f() { this.cfg().bpduguard = false; } },
+    { m: 'I', t: 'S', p: ['switchport', 'port-security'], f() {
+      const c = this.cfg();
+      if (c.mode !== 'access') return [L('err', 'Command rejected: ' + this.ifn + ' is a dynamic port.')];
+      c.psec = Object.assign({ max: 1, macs: [], dyn: [], violation: 'shutdown', viol: 0 }, c.psec || {}, { on: true }); this.net.touch();
+    } },
+    { m: 'I', t: 'S', p: ['no', 'switchport', 'port-security'], f() { const c = this.cfg(); if (c.psec) { c.psec.on = false; c.psec.dyn = []; } this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['switchport', 'port-security', 'maximum', 'NUM'], f(v) { this.psec().max = v[0]; this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['switchport', 'port-security', 'violation', 'shutdown'], f() { this.psec().violation = 'shutdown'; } },
+    { m: 'I', t: 'S', p: ['switchport', 'port-security', 'violation', 'restrict'], f() { this.psec().violation = 'restrict'; } },
+    { m: 'I', t: 'S', p: ['switchport', 'port-security', 'violation', 'protect'], f() { this.psec().violation = 'protect'; } },
+    { m: 'I', t: 'S', p: ['switchport', 'port-security', 'mac-address', 'sticky'], f() { const ps = this.psec(); ps.sticky = true; ps.macs = (ps.macs || []).concat(ps.dyn || []); ps.dyn = []; this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['switchport', 'port-security', 'mac-address', 'sticky', 'MAC'], f(v) { const ps = this.psec(); if (ps.macs.indexOf(v[0]) < 0) ps.macs.push(v[0]); this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['switchport', 'port-security', 'mac-address', 'MAC'], f(v) { const ps = this.psec(); if (ps.macs.indexOf(v[0]) < 0) ps.macs.push(v[0]); this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['no', 'switchport', 'port-security', 'mac-address', 'sticky', 'MAC'], f(v) { const ps = this.psec(); ps.macs = ps.macs.filter(m => m !== v[0]); this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['no', 'switchport', 'port-security', 'mac-address', 'MAC'], f(v) { const ps = this.psec(); ps.macs = ps.macs.filter(m => m !== v[0]); this.net.touch(); } },
+    { m: 'I', t: 'S', p: ['no', 'switchport', 'port-security', 'mac-address', 'sticky'], f() { const ps = this.psec(); ps.sticky = false; ps.macs = []; this.net.touch(); } },
+    { m: 'P', t: 'S', p: ['clear', 'port-security', 'sticky', 'interface', 'IFACE'], f(v) { const c = this.net.ifaceCfg(this.name, v[0]); if (c.psec) { c.psec.macs = []; this.net.touch(); } } },
+    { m: 'P', t: 'S', p: ['clear', 'port-security', 'all'], f() { Object.keys(this.d.ports).forEach(n => { const ps = this.d.ports[n].psec; if (ps) { ps.macs = []; ps.dyn = []; } }); this.net.touch(); } },
+    { m: 'UP', t: 'S', p: ['show', 'port-security'], f() { return this.showPsec(); } },
+    { m: 'UP', t: 'S', p: ['show', 'port-security', 'address'], f() { return this.showPsecAddr(); } },
+    { m: 'UP', t: 'S', p: ['show', 'port-security', 'interface', 'IFACE'], f(v) { return this.showPsecIf(v[0]); } },
+    { m: 'UP', p: ['show', 'interfaces', 'IFACE'], f(v) { return this.showInterface(v[0]); } },
+
+    // ----- access lists -----
+    { m: 'C', t: 'R', p: ['access-list', 'ACLNUM', 'permit', 'LINE'], f(v) { return this.aclAdd(String(v[0]), v[0] < 100 ? 'std' : 'ext', 'permit', v[1], null, 3); } },
+    { m: 'C', t: 'R', p: ['access-list', 'ACLNUM', 'deny', 'LINE'], f(v) { return this.aclAdd(String(v[0]), v[0] < 100 ? 'std' : 'ext', 'deny', v[1], null, 3); } },
+    { m: 'C', t: 'R', p: ['no', 'access-list', 'ACLNUM'], f(v) { this.aclDel(String(v[0])); } },
+    // IOS quirk: on a numbered ACL, "no access-list N permit ..." deletes the whole list, not one line.
+    { m: 'C', t: 'R', p: ['no', 'access-list', 'ACLNUM', 'LINE'], f(v) { this.aclDel(String(v[0])); } },
+    { m: 'C', t: 'R', p: ['ip', 'access-list', 'standard', 'WORD'], f(v) { return this.aclMode(v[0], 'std'); } },
+    { m: 'C', t: 'R', p: ['ip', 'access-list', 'extended', 'WORD'], f(v) { return this.aclMode(v[0], 'ext'); } },
+    { m: 'C', t: 'R', p: ['no', 'ip', 'access-list', 'standard', 'WORD'], f(v) { this.aclDel(v[0]); } },
+    { m: 'C', t: 'R', p: ['no', 'ip', 'access-list', 'extended', 'WORD'], f(v) { this.aclDel(v[0]); } },
+    { m: 'A', p: ['permit', 'LINE'], f(v) { return this.aclAdd(this.acl, this.aclType(), 'permit', v[0], null, 1); } },
+    { m: 'A', p: ['deny', 'LINE'], f(v) { return this.aclAdd(this.acl, this.aclType(), 'deny', v[0], null, 1); } },
+    { m: 'A', p: ['NUM', 'permit', 'LINE'], f(v) { return this.aclAdd(this.acl, this.aclType(), 'permit', v[1], v[0], 2); } },
+    { m: 'A', p: ['NUM', 'deny', 'LINE'], f(v) { return this.aclAdd(this.acl, this.aclType(), 'deny', v[1], v[0], 2); } },
+    { m: 'A', p: ['no', 'NUM'], f(v) { const a = this.d.acls[this.acl]; a.entries = a.entries.filter(e => e.seq !== v[0]); this.net.touch(); } },
+    { m: 'I', t: 'R', p: ['ip', 'access-group', 'WORD', 'in'], f(v) { this.cfg().aclIn = v[0]; this.net.touch(); } },
+    { m: 'I', t: 'R', p: ['ip', 'access-group', 'WORD', 'out'], f(v) { this.cfg().aclOut = v[0]; this.net.touch(); } },
+    { m: 'I', t: 'R', p: ['no', 'ip', 'access-group', 'WORD', 'in'], f() { delete this.cfg().aclIn; this.net.touch(); } },
+    { m: 'I', t: 'R', p: ['no', 'ip', 'access-group', 'WORD', 'out'], f() { delete this.cfg().aclOut; this.net.touch(); } },
+    { m: 'UP', t: 'R', p: ['show', 'access-lists'], f() { return this.showAcl(); } },
+    { m: 'UP', t: 'R', p: ['show', 'ip', 'access-lists'], f() { return this.showAcl(); } },
+    { m: 'UP', t: 'R', p: ['show', 'ip', 'interface'], f() { return this.showIpInt(null); } },
+    { m: 'UP', t: 'R', p: ['show', 'ip', 'interface', 'IFACE'], f(v) { return this.showIpInt(v[0]); } },
+
+    { m: 'CIVA', p: ['exit'], f() { this.mode = this.mode === 'config' ? 'priv' : 'config'; this.ifn = null; this.vlan = null; this.acl = null; } },
+    { m: 'CIVA', p: ['end'], f() { this.mode = 'priv'; this.ifn = null; this.vlan = null; this.acl = null; return [L('sys', '%SYS-5-CONFIG_I: Configured from console by console')]; } },
+    { m: 'CIVA', p: ['do', 'LINE'], f(v) { return this.execIn(v[0], 'priv'); } }
   ];
 
   class IOSShell {
     constructor(net, name, log) { this.net = net; this.name = name; this.log = log || function () {}; this.mode = 'user'; this.ifn = null; this.vlan = null; }
     get d() { return this.net.devices[this.name]; }
     host() { return this.d.hostname || this.name; }
-    prompt() { return this.host() + (this.mode === 'config-if' && this.ifn && isSub(this.ifn) ? '(config-subif)#' : ({ user: '>', priv: '#', config: '(config)#', 'config-if': '(config-if)#', 'config-vlan': '(config-vlan)#' })[this.mode]); }
+    prompt() { return this.host() + (this.mode === 'config-if' && this.ifn && isSub(this.ifn) ? '(config-subif)#' : ({ user: '>', priv: '#', config: '(config)#', 'config-if': '(config-if)#', 'config-vlan': '(config-vlan)#', 'config-std-nacl': '(config-std-nacl)#', 'config-ext-nacl': '(config-ext-nacl)#' })[this.mode]); }
+    psec() { const c = this.cfg(); return (c.psec = Object.assign({ on: false, max: 1, macs: [], dyn: [], violation: 'shutdown', viol: 0 }, c.psec || {})); }
+    aclType() { return this.mode === 'config-std-nacl' ? 'std' : 'ext'; }
+    caret(i) { const t = this._toks && this._toks[i]; return [L('err', ' '.repeat(this.prompt().length + (t ? t.pos : 0)) + '^'), L('err', "% Invalid input detected at '^' marker.")]; }
+    aclMode(name, type) {
+      const acls = this.d.acls = this.d.acls || {};
+      if (acls[name] && acls[name].type !== type) return [L('err', '% A named ' + (type === 'std' ? 'extended' : 'standard') + ' IP access list with this name already exists')];
+      if (!acls[name]) acls[name] = { type, entries: [] };
+      this.mode = type === 'std' ? 'config-std-nacl' : 'config-ext-nacl'; this.acl = name;
+    }
+    aclDel(name) { if (this.d.acls) delete this.d.acls[name]; this.net.touch(); }
+    // first = index of the first token after permit/deny, for the error caret.
+    aclAdd(name, type, action, rest, seq, first) {
+      const acls = this.d.acls = this.d.acls || {};
+      const a = acls[name] || (acls[name] = { type, entries: [] });
+      const t = rest.split(/\s+/).filter(Boolean), e = parseAce(type, action, t);
+      if (e.err !== undefined) return this.caret(first + e.err);
+      if (seq === null) seq = a.entries.length ? a.entries[a.entries.length - 1].seq + 10 : 10;
+      else if (a.entries.some(x => x.seq === seq)) return [L('err', '% Duplicate sequence number')];
+      const key = aceText(type, e) + e.action;
+      if (a.entries.some(x => aceText(type, x) + x.action === key)) return [];
+      e.seq = seq; a.entries.push(e); a.entries.sort((x, y) => x.seq - y.seq); this.net.touch();
+    }
+    // Bring a link up or down after a speed or duplex change, with the log lines both ends would print.
+    relink() {
+      const n = this.ifn, p = this.net.peer(this.name, n), was = this.net.status(this.name, n), pWas = p ? this.net.status(p.dev, p.ifn) : null;
+      this.net.touch();
+      const out = this.stateLines(n, was, this.net.status(this.name, n));
+      if (p && !this.net.isHost(p.dev)) { const pl = this.stateLines(p.ifn, pWas, this.net.status(p.dev, p.ifn)); if (pl.length) this.log(p.dev, pl); }
+      return out;
+    }
     cfg() { return this.net.ifaceCfg(this.name, this.ifn); }
     cmdsFor(mode) {
       const code = MODES[mode], t = this.d.type === 'router' ? 'R' : 'S', sub = mode === 'config-if' && !!this.ifn && isSub(this.ifn);
@@ -419,6 +678,9 @@
         case 'VLAN': return /^\d+$/.test(s) && +s >= 1 && +s <= 4094 ? +s : undefined;
         case 'VLANLIST': return /^[\d,-]+$/.test(s) ? (parseVlanList(s) || undefined) : undefined;
         case 'WORD': return s;
+        case 'NUM': return /^\d{1,9}$/.test(s) ? +s : undefined;
+        case 'ACLNUM': return /^\d{1,3}$/.test(s) && +s >= 1 && +s <= 199 ? +s : undefined;
+        case 'MAC': return isMac(s) ? s.toLowerCase() : undefined;
       }
       return undefined;
     }
@@ -462,6 +724,7 @@
       const complete = r.cands.filter(cd => cd.done || cd.c.p.length === r.n);
       if (!complete.length) return { lines: [L('err', '% Incomplete command.')] };
       const cd = complete[0];
+      this._toks = toks;
       const res = cd.c.f.call(this, cd.vals);
       if (!res) return { lines: [] };
       return Array.isArray(res) ? { lines: res } : res;
@@ -524,10 +787,14 @@
       return out;
     }
     setShut(v) {
-      const n = this.ifn, before = this.net.status(this.name, n), p = this.net.peer(this.name, n);
+      const n = this.ifn, c = this.cfg(), before = this.net.status(this.name, n), p = this.net.peer(this.name, n);
+      // An err-disabled port only recovers with shutdown followed by no shutdown.
+      if (!v && !c.shutdown) return [];
       const pBefore = p ? this.net.status(p.dev, p.ifn) : null;
-      this.cfg().shutdown = v; this.net.touch();
-      const lines = this.stateLines(n, before, this.net.status(this.name, n));
+      c.shutdown = v; if (v) delete c.errdis;
+      this.net.touch();
+      const checks = !v && this.d.type === 'switch' ? this.net.portChecks(this.name, n) : [];
+      const lines = checks.concat(this.stateLines(n, before, this.net.status(this.name, n)));
       if (p && !this.net.isHost(p.dev)) { const pl = this.stateLines(p.ifn, pBefore, this.net.status(p.dev, p.ifn)); if (pl.length) this.log(p.dev, pl); }
       return lines;
     }
@@ -537,8 +804,10 @@
       const r = this.net.ping(this.name, ip);
       const lines = [L('out', 'Type escape sequence to abort.'), L('out', 'Sending 5, 100-byte ICMP Echos to ' + ip + ', timeout is 2 seconds:')];
       let marks, got;
-      if (r.ok) { marks = r.arpMiss ? '.!!!!' : '!!!!!'; got = r.arpMiss ? 4 : 5; }
-      else { marks = r.stage === 'request' && r.kind === 'noroute' && r.at !== this.name ? 'U.U.U' : '.....'; got = 0; }
+      if (r.ok && r.lossy) { marks = '!.!!.'; got = 3; }
+      else if (r.ok) { marks = r.arpMiss ? '.!!!!' : '!!!!!'; got = r.arpMiss ? 4 : 5; }
+      else if (r.stage === 'request' && r.kind === 'ttl') { marks = '&&&&&'; got = 0; }
+      else { marks = r.stage === 'request' && (r.kind === 'noroute' || r.kind === 'acl') && r.at !== this.name ? 'U.U.U' : '.....'; got = 0; }
       lines.push(L(r.ok ? 'ok' : 'err', marks));
       lines.push(L('out', 'Success rate is ' + got * 20 + ' percent (' + got + '/5)' + (got ? ', round-trip min/avg/max = 0/0/1 ms' : '')));
       return { lines, ping: { from: this.name, to: ip, res: r } };
@@ -574,7 +843,7 @@
     showVlanBrief() {
       const d = this.d, out = ['VLAN Name                             Status    Ports', '---- -------------------------------- --------- -------------------------------'];
       Object.keys(d.vlans).map(Number).sort((a, b) => a - b).forEach(v => {
-        const ports = Object.keys(d.ports).filter(n => d.ports[n].mode === 'access' && d.ports[n].vlan === v).map(shortIf).join(', ');
+        const ports = Object.keys(d.ports).filter(n => !this.net.opTrunk(this.name, n) && (d.ports[n].vlan || 1) === v).map(shortIf).join(', ');
         out.push(pad(v, 5) + pad(d.vlans[v], 33) + pad('active', 10) + ports);
       });
       // Ports assigned to a VLAN that no longer exists are shown as inactive, like real IOS.
@@ -583,13 +852,14 @@
     }
     showTrunk() {
       const d = this.d;
-      const tr = Object.keys(d.ports).filter(n => d.ports[n].mode === 'trunk' && this.net.status(this.name, n).protocol === 'up');
+      const tr = Object.keys(d.ports).filter(n => this.net.opTrunk(this.name, n) && this.net.status(this.name, n).protocol === 'up');
       if (!tr.length) return [];
       const out = [pad('Port', 12) + pad('Mode', 13) + pad('Encapsulation', 15) + pad('Status', 14) + 'Native vlan'];
-      tr.forEach(n => out.push(pad(shortIf(n), 12) + pad('on', 13) + pad('802.1q', 15) + pad('trunking', 14) + (d.ports[n].native || 1)));
+      const md = m => m === 'trunk' ? 'on' : m === 'dynamic auto' ? 'auto' : 'desirable';
+      tr.forEach(n => out.push(pad(shortIf(n), 12) + pad(md(d.ports[n].mode), 13) + pad('802.1q', 15) + pad('trunking', 14) + (d.ports[n].native || 1)));
       const sect = (title, fn) => { out.push(''); out.push(pad('Port', 12) + title); tr.forEach(n => out.push(pad(shortIf(n), 12) + fn(d.ports[n]))); };
-      const active = p => { const ids = Object.keys(d.vlans).map(Number); const list = p.allowed === 'all' ? ids : p.allowed.filter(v => ids.indexOf(v) >= 0); return fmtVlans(uniqSort(list)); };
-      sect('Vlans allowed on trunk', p => fmtVlans(p.allowed));
+      const active = p => { const ids = Object.keys(d.vlans).map(Number); const list = !p.allowed || p.allowed === 'all' ? ids : p.allowed.filter(v => ids.indexOf(v) >= 0); return fmtVlans(uniqSort(list)); };
+      sect('Vlans allowed on trunk', p => fmtVlans(p.allowed || 'all'));
       sect('Vlans allowed and active in management domain', active);
       sect('Vlans in spanning tree forwarding state and not pruned', active);
       return out.map(s => L('out', s));
@@ -597,21 +867,23 @@
     showIntStatus() {
       const d = this.d, out = [pad('Port', 10) + pad('Name', 19) + pad('Status', 13) + pad('Vlan', 11) + pad('Duplex', 8) + pad('Speed', 6) + 'Type'];
       Object.keys(d.ports).forEach(n => {
-        const c = d.ports[n], st = this.net.status(this.name, n), gi = n.indexOf('Gigabit') === 0;
-        const s = c.shutdown ? 'disabled' : st.protocol !== 'up' ? 'notconnect' : c.mode === 'access' && !d.vlans[c.vlan] ? 'inactive' : 'connected';
-        const up = s === 'connected' || s === 'inactive';
-        out.push(pad(shortIf(n), 10) + pad((c.description || '').slice(0, 18), 19) + pad(s, 13) + pad(c.mode === 'trunk' ? 'trunk' : c.vlan, 11) + pad(up ? 'a-full' : 'auto', 8) + pad(up ? (gi ? 'a-1000' : 'a-100') : 'auto', 6) + (gi ? '10/100/1000BaseTX' : '10/100BaseTX'));
+        const c = d.ports[n], st = this.net.status(this.name, n), gi = n.indexOf('Gigabit') === 0, tr = this.net.opTrunk(this.name, n);
+        const s = c.shutdown ? 'disabled' : st.errdis ? 'err-disabled' : st.protocol !== 'up' ? 'notconnect' : !tr && !d.vlans[c.vlan || 1] ? 'inactive' : 'connected';
+        const up = s === 'connected' || s === 'inactive', em = up ? this.net.endMode(this.name, n) : null;
+        const dx = (c.duplex || 'auto') === 'auto' ? (em ? 'a-' + em.duplex : 'auto') : c.duplex;
+        const sp = (c.speed || 'auto') === 'auto' ? (em ? 'a-' + em.speed : 'auto') : c.speed;
+        out.push(pad(shortIf(n), 10) + pad((c.description || '').slice(0, 18), 19) + pad(s, 13) + pad(tr ? 'trunk' : (c.vlan || 1), 11) + pad(dx, 8) + pad(sp, 6) + (gi ? '10/100/1000BaseTX' : '10/100BaseTX'));
       });
       return out.map(s => L('out', s));
     }
     showSwitchport() {
       const d = this.d, out = [], vn = v => v + ' (' + (d.vlans[v] || 'Inactive') + ')';
       Object.keys(d.ports).forEach(n => {
-        const c = d.ports[n], tr = c.mode === 'trunk', up = this.net.status(this.name, n).protocol === 'up';
-        out.push('Name: ' + shortIf(n), 'Switchport: Enabled', 'Administrative Mode: ' + (tr ? 'trunk' : 'static access'),
+        const c = d.ports[n], tr = this.net.opTrunk(this.name, n), up = this.net.status(this.name, n).protocol === 'up', m = c.mode || 'access';
+        out.push('Name: ' + shortIf(n), 'Switchport: Enabled', 'Administrative Mode: ' + (m === 'access' ? 'static access' : m),
           'Operational Mode: ' + (!up ? 'down' : tr ? 'trunk' : 'static access'), 'Administrative Trunking Encapsulation: dot1q',
-          'Negotiation of Trunking: ' + (tr ? 'On' : 'Off'), 'Access Mode VLAN: ' + vn(c.vlan || 1), 'Trunking Native Mode VLAN: ' + vn(c.native || 1),
-          'Trunking VLANs Enabled: ' + (c.allowed === 'all' ? 'ALL' : fmtVlans(c.allowed)), '');
+          'Negotiation of Trunking: ' + (m === 'access' ? 'Off' : 'On'), 'Access Mode VLAN: ' + vn(c.vlan || 1), 'Trunking Native Mode VLAN: ' + vn(c.native || 1),
+          'Trunking VLANs Enabled: ' + (!c.allowed || c.allowed === 'all' ? 'ALL' : fmtVlans(c.allowed)), '');
       });
       return out.map(s => L('out', s));
     }
@@ -627,6 +899,68 @@
       });
       return out.map(s => L('out', s));
     }
+    showAcl() {
+      const out = [], acls = this.d.acls || {};
+      Object.keys(acls).sort((a, b) => (/^\d+$/.test(a) && /^\d+$/.test(b)) ? a - b : a < b ? -1 : 1).forEach(k => {
+        const a = acls[k];
+        out.push((a.type === 'std' ? 'Standard' : 'Extended') + ' IP access list ' + k);
+        a.entries.forEach(e => out.push('    ' + e.seq + ' ' + (a.type === 'std' ? pad(e.action, 6) : e.action + ' ') + aceText(a.type, e) + (e.hits ? ' (' + e.hits + ' match' + (e.hits === 1 ? '' : 'es') + ')' : '')));
+      });
+      return out.map(s => L('out', s));
+    }
+    showIpInt(only) {
+      const out = [];
+      this.net.ifaceNames(this.name).filter(n => !only || n === only).forEach(n => {
+        const x = this.d.ifaces[n], st = this.net.status(this.name, n);
+        out.push(n + ' is ' + st.status + ', line protocol is ' + st.protocol);
+        if (x.ip) out.push('  Internet address is ' + x.ip + '/' + prefixLen(x.mask), '  Broadcast address is 255.255.255.255', '  MTU is 1500 bytes');
+        else out.push('  Internet protocol processing disabled');
+        if (x.ip) out.push('  Outgoing access list is ' + (x.aclOut || 'not set'), '  Inbound  access list is ' + (x.aclIn || 'not set'), '  Proxy ARP is enabled', '  ICMP redirects are always sent');
+      });
+      return out.map(s => L('out', s));
+    }
+    showInterface(n) {
+      const st = this.net.status(this.name, n), c = this.net.ifaceCfg(this.name, n), sw = this.d.type === 'switch', gi = /^Gigabit/.test(n);
+      const tag = sw ? (st.errdis ? ' (err-disabled)' : c.shutdown ? ' (disabled)' : st.protocol === 'up' ? ' (connected)' : ' (notconnect)') : '';
+      const em = st.protocol === 'up' ? this.net.endMode(this.name, n) : null, mac = this.net.mac(this.name, n);
+      const p = this.net.peer(this.name, n), bad = em && p && this.net.duplexMismatch(p.link), h = hash32(this.name + n);
+      const out = [n + ' is ' + st.status + ', line protocol is ' + st.protocol + tag, '  Hardware is ' + (gi ? 'Gigabit Ethernet' : 'Fast Ethernet') + ', address is ' + mac + ' (bia ' + mac + ')'];
+      if (c.description) out.push('  Description: ' + c.description);
+      if (!sw && c.ip) out.push('  Internet address is ' + c.ip + '/' + prefixLen(c.mask));
+      out.push('  MTU 1500 bytes, BW ' + ((em ? em.speed : cap(this.name, n)) * 1000) + ' Kbit/sec, DLY ' + (gi ? 10 : 100) + ' usec,');
+      out.push('  ' + (em ? (em.duplex === 'full' ? 'Full-duplex' : 'Half-duplex') + ', ' + em.speed + 'Mb/s' : (c.duplex && c.duplex !== 'auto' ? c.duplex[0].toUpperCase() + c.duplex.slice(1) + '-duplex' : 'Auto-duplex') + ', ' + (c.speed && c.speed !== 'auto' ? c.speed + 'Mb/s' : 'Auto-speed')) + ', media type is ' + (gi ? '10/100/1000BaseTX' : '10/100BaseTX'));
+      const pin = em ? 9000 + h % 40000 : 0, crc = bad && em.duplex === 'full' ? 1200 + h % 900 : 0, late = bad && em.duplex === 'half' ? 800 + h % 700 : 0;
+      out.push('  5 minute input rate ' + (em ? 2000 + h % 9000 : 0) + ' bits/sec, ' + (em ? 3 + h % 9 : 0) + ' packets/sec');
+      out.push('     ' + pin + ' packets input, ' + pin * 131 + ' bytes, 0 no buffer');
+      out.push('     ' + crc + ' input errors, ' + crc + ' CRC, 0 frame, 0 overrun, 0 ignored');
+      out.push('     ' + (crc ? Math.floor(crc / 3) : 0) + ' runts, 0 giants');
+      out.push('     0 output errors, ' + (late ? late * 3 : 0) + ' collisions, 0 interface resets');
+      out.push('     ' + late + ' late collision, 0 deferred');
+      return out.map(s => L('out', s));
+    }
+    showPsec() {
+      const d = this.d, out = ['Secure Port  MaxSecureAddr  CurrentAddr  SecurityViolation  Security Action', '                (Count)       (Count)          (Count)', '---------------------------------------------------------------------------'];
+      Object.keys(d.ports).forEach(n => { const ps = d.ports[n].psec; if (!ps || !ps.on) return; out.push(shortIf(n).padStart(10) + String(ps.max || 1).padStart(15) + String((ps.macs || []).length + (ps.dyn || []).length).padStart(13) + String(ps.viol || 0).padStart(19) + '         ' + (ps.violation || 'shutdown').replace(/^./, x => x.toUpperCase())); });
+      out.push('---------------------------------------------------------------------------', 'Total Addresses in System (excluding one mac per port)     : 0', 'Max Addresses limit in System (excluding one mac per port) : 4096');
+      return out.map(s => L('out', s));
+    }
+    showPsecAddr() {
+      const d = this.d, out = ['          Secure Mac Address Table', '-----------------------------------------------------------------------------', 'Vlan    Mac Address       Type                          Ports   Remaining Age', '                                                                   (mins)', '----    -----------       ----                          -----   -------------'];
+      Object.keys(d.ports).forEach(n => { const ps = d.ports[n].psec; if (!ps || !ps.on) return; const v = String(d.ports[n].vlan || 1);
+        (ps.macs || []).forEach(m => out.push(v.padStart(4) + '    ' + pad(m, 18) + pad(ps.sticky ? 'SecureSticky' : 'SecureConfigured', 30) + pad(shortIf(n), 8) + '    -'));
+        (ps.dyn || []).forEach(m => out.push(v.padStart(4) + '    ' + pad(m, 18) + pad('SecureDynamic', 30) + pad(shortIf(n), 8) + '    -')); });
+      out.push('-----------------------------------------------------------------------------');
+      return out.map(s => L('out', s));
+    }
+    showPsecIf(n) {
+      const c = this.d.ports[n], ps = c.psec || {}, st = this.net.status(this.name, n), on = !!ps.on;
+      const status = !on ? 'Secure-down' : st.errdis === 'psecure-violation' ? 'Secure-shutdown' : st.protocol === 'up' ? 'Secure-up' : 'Secure-down';
+      const out = ['Port Security              : ' + (on ? 'Enabled' : 'Disabled'), 'Port Status                : ' + status, 'Violation Mode             : ' + (ps.violation || 'shutdown').replace(/^./, x => x.toUpperCase()),
+        'Aging Time                 : 0 mins', 'Aging Type                 : Absolute', 'SecureStatic Address Aging : Disabled', 'Maximum MAC Addresses      : ' + (ps.max || 1),
+        'Total MAC Addresses        : ' + ((ps.macs || []).length + (ps.dyn || []).length), 'Configured MAC Addresses   : ' + (ps.sticky ? 0 : (ps.macs || []).length), 'Sticky MAC Addresses       : ' + (ps.sticky ? (ps.macs || []).length : 0),
+        'Last Source Address:Vlan   : ' + (ps.last ? ps.last + ':' + (c.vlan || 1) : '0000.0000.0000:0'), 'Security Violation Count   : ' + (ps.viol || 0)];
+      return out.map(s => L('out', s));
+    }
     showRun() {
       const d = this.d, c = [];
       c.push('!', 'version 15.2', 'no service timestamps log datetime msec', '!', 'hostname ' + this.host(), '!');
@@ -637,12 +971,20 @@
           if (x.description) c.push(' description ' + x.description);
           if (isSub(n) && x.encap) c.push(' encapsulation dot1Q ' + x.encap);
           c.push(x.ip ? ' ip address ' + x.ip + ' ' + x.mask : ' no ip address');
+          if (x.aclIn) c.push(' ip access-group ' + x.aclIn + ' in');
+          if (x.aclOut) c.push(' ip access-group ' + x.aclOut + ' out');
+          if (x.duplex && x.duplex !== 'auto') c.push(' duplex ' + x.duplex);
+          if (x.speed && x.speed !== 'auto') c.push(' speed ' + x.speed);
           if (x.shutdown) c.push(' shutdown');
           c.push('!');
         });
         c.push('ip classless');
         (d.routes || []).forEach(r => c.push('ip route ' + r.net + ' ' + r.mask + ' ' + r.nh));
         c.push('!');
+        const acls = d.acls || {};
+        Object.keys(acls).filter(k => /^\d+$/.test(k)).sort((a, b) => a - b).forEach(k => acls[k].entries.forEach(e => c.push('access-list ' + k + ' ' + pad(e.action, 6) + aceRun(acls[k].type, e))));
+        Object.keys(acls).filter(k => !/^\d+$/.test(k)).forEach(k => { c.push('ip access-list ' + (acls[k].type === 'std' ? 'standard ' : 'extended ') + k); acls[k].entries.forEach(e => c.push(' ' + e.action + ' ' + aceRun(acls[k].type, e))); });
+        if (Object.keys(acls).length) c.push('!');
       } else {
         Object.keys(d.ports).forEach(n => {
           const x = d.ports[n];
@@ -650,8 +992,20 @@
           if (x.description) c.push(' description ' + x.description);
           if (x.mode === 'access' && x.vlan !== 1) c.push(' switchport access vlan ' + x.vlan);
           if (x.mode === 'trunk' && x.native && x.native !== 1) c.push(' switchport trunk native vlan ' + x.native);
-          if (x.mode === 'trunk' && x.allowed !== 'all') c.push(' switchport trunk allowed vlan ' + fmtVlans(x.allowed));
-          c.push(' switchport mode ' + x.mode);
+          if (x.mode === 'trunk' && x.allowed && x.allowed !== 'all') c.push(' switchport trunk allowed vlan ' + fmtVlans(x.allowed));
+          c.push(' switchport mode ' + (x.mode || 'access'));
+          const ps = x.psec;
+          if (ps && ps.on) {
+            c.push(' switchport port-security');
+            if ((ps.max || 1) !== 1) c.push(' switchport port-security maximum ' + ps.max);
+            if (ps.violation && ps.violation !== 'shutdown') c.push(' switchport port-security violation ' + ps.violation);
+            if (ps.sticky) c.push(' switchport port-security mac-address sticky');
+            (ps.macs || []).forEach(m => c.push(' switchport port-security mac-address ' + (ps.sticky ? 'sticky ' : '') + m));
+          }
+          if (x.duplex && x.duplex !== 'auto') c.push(' duplex ' + x.duplex);
+          if (x.speed && x.speed !== 'auto') c.push(' speed ' + x.speed);
+          if (x.portfast) c.push(' spanning-tree portfast');
+          if (x.bpduguard) c.push(' spanning-tree bpduguard enable');
           if (x.shutdown) c.push(' shutdown');
           c.push('!');
         });
@@ -672,34 +1026,79 @@
       if (!t.length) return { lines: [] };
       const c = t[0].toLowerCase(), d = this.net.devices[this.name];
       if (c === 'ipconfig') {
-        return { lines: ['', 'FastEthernet0 Connection:(default port)', '', '   Connection-specific DNS Suffix..: ',
-          '   IPv4 Address....................: ' + (d.ip || '0.0.0.0'), '   Subnet Mask.....................: ' + (d.mask || '0.0.0.0'),
-          '   Default Gateway.................: ' + (d.gw || '0.0.0.0'), ''].map(s => L('out', s)) };
+        const all = (t[1] || '').toLowerCase() === '/all';
+        const rows = ['', 'FastEthernet0 Connection:(default port)', '', '   Connection-specific DNS Suffix..: '];
+        if (all) rows.push('   Physical Address................: ' + winMac(this.net.mac(this.name)), '   DHCP Enabled....................: No');
+        rows.push('   IPv4 Address....................: ' + (d.ip || '0.0.0.0'), '   Subnet Mask.....................: ' + (d.mask || '0.0.0.0'), '   Default Gateway.................: ' + (d.gw || '0.0.0.0'), '');
+        return { lines: rows.map(s => L('out', s)) };
       }
       if (c === 'ping') { const ip = t.slice(1).find(isIP); return ip ? this.ping(ip) : { lines: [L('err', 'Usage: ping <IPv4 address>')] }; }
       if (c === 'tracert') { const ip = t.slice(1).find(isIP); return ip ? this.tracert(ip) : { lines: [L('err', 'Usage: tracert <IPv4 address>')] }; }
+      if (c === 'curl') {
+        const u = t.slice(1).find(x => x[0] !== '-');
+        if (!u) return { lines: [L('err', 'curl: try \'curl --help\' for more information')] };
+        const m = /^(?:https?:\/\/)?([^/:]+)(?::(\d+))?/i.exec(u), host = m ? m[1] : u;
+        if (!isIP(host)) return { lines: [L('err', 'curl: (6) Could not resolve host: ' + host)] };
+        return this.connect(host, m[2] ? +m[2] : 80, 'curl');
+      }
+      if (c === 'tnc' || c === 'test-netconnection') {
+        const ip = t.slice(1).find(isIP), pi = t.findIndex(x => /^-port$/i.test(x)), port = pi > 0 ? +t[pi + 1] : 0;
+        if (!ip || !(port > 0 && port < 65536)) return { lines: [L('err', 'Usage: tnc <IPv4 address> -port <number>')] };
+        return this.connect(ip, port, 'tnc');
+      }
       if (c === 'help' || c === '?') {
-        return { lines: ['Available commands:', '  ipconfig            Show this PC\'s IP settings', '  ping <address>      Test reachability (4 echo requests)',
-          '  tracert <address>   List the routers on the path', '  cls                 Clear the screen', '', 'Change addresses in the IP settings tab.'].map(s => L('out', s)) };
+        return { lines: ['Available commands:', '  ipconfig [/all]          Show this PC\'s IP settings (/all adds the MAC address)', '  ping <address>           Test reachability (4 echo requests)',
+          '  tracert <address>        List the routers on the path', '  curl http://<address>    Load a web page (TCP port 80)', '  tnc <address> -port <n>  Test a TCP port (Test-NetConnection)',
+          '  cls                      Clear the screen', '', 'Change addresses in the IP settings tab.'].map(s => L('out', s)) };
       }
       if (c === 'cls' || c === 'clear') return { lines: [], clear: true };
       return { lines: [L('err', 'Invalid Command.')] };
+    }
+    // What Windows prints when a ping fails. Routers report unreachable networks and TTL expiry back to the sender,
+    // if that message can find its way back.
+    failLine(r) {
+      const d = this.net.devices[this.name];
+      if (r.stage === 'request' && r.kind === 'arp' && r.at === this.name) return 'Reply from ' + d.ip + ': Destination host unreachable.';
+      if (r.stage !== 'request' || r.at === this.name || ['noroute', 'acl', 'ttl'].indexOf(r.kind) < 0) return null;
+      const arr = r.fwd.arrivals.filter(a => a.dev === r.at).pop() || r.fwd.arrivals[r.fwd.arrivals.length - 1];
+      if (!arr) return null;
+      const back = this.net.route(r.at, d.ip);
+      if (!back.ok || back.dev !== this.name) return null;
+      return 'Reply from ' + arr.ip + ': ' + (r.kind === 'ttl' ? 'TTL expired in transit.' : r.kind === 'acl' ? 'Destination host unreachable.' : 'Destination net unreachable.');
     }
     ping(ip) {
       const d = this.net.devices[this.name];
       if (!d.ip) return { lines: [L('err', 'Unable to ping: this PC has no IP address. Set one in IP settings.')] };
       const r = this.net.ping(this.name, ip);
       const lines = [L('out', ''), L('out', 'Pinging ' + ip + ' with 32 bytes of data:'), L('out', '')];
-      const ttl = r.ok ? (this.net.isRouter(r.dstDev) ? 255 : 128) - r.back.arrivals.length : 0;
+      const ttl = r.ok ? (this.net.isRouter(r.dstDev) ? 255 : 128) - r.back.arrivals.length : 0, fl = r.ok ? null : this.failLine(r);
       let got = 0;
       for (let i = 0; i < 4; i++) {
-        if (!r.ok || (i === 0 && r.arpMiss)) lines.push(L('err', 'Request timed out.'));
-        else { lines.push(L('ok', 'Reply from ' + ip + ': bytes=32 time<1ms TTL=' + ttl)); got++; }
+        // Windows counts error replies as "received", which is why a failing ping can show 0% loss.
+        if (fl) { lines.push(L('err', fl)); got++; }
+        else if (!r.ok || (i === 0 && r.arpMiss) || (r.lossy && i % 3 === 1)) lines.push(L('err', 'Request timed out.'));
+        else { lines.push(L('ok', 'Reply from ' + ip + ': bytes=32 time' + (r.lossy ? '=' + (14 + i * 9) + 'ms' : '<1ms') + ' TTL=' + ttl)); got++; }
       }
       lines.push(L('out', ''), L('out', 'Ping statistics for ' + ip + ':'), L('out', '    Packets: Sent = 4, Received = ' + got + ', Lost = ' + (4 - got) + ' (' + (4 - got) * 25 + '% loss),'));
-      if (got) lines.push(L('out', 'Approximate round trip times in milli-seconds:'), L('out', '    Minimum = 0ms, Maximum = 0ms, Average = 0ms'));
+      if (got && !fl) lines.push(L('out', 'Approximate round trip times in milli-seconds:'), L('out', r.lossy ? '    Minimum = 14ms, Maximum = 41ms, Average = 26ms' : '    Minimum = 0ms, Maximum = 0ms, Average = 0ms'));
       lines.push(L('out', ''));
       return { lines, ping: { from: this.name, to: ip, res: r } };
+    }
+    connect(ip, port, tool) {
+      const d = this.net.devices[this.name];
+      if (!d.ip) return { lines: [L('err', 'This PC has no IP address. Set one in IP settings.')] };
+      const r = this.net.connect(this.name, ip, port), lines = [];
+      if (tool === 'curl') {
+        if (r.ok) { const site = this.net.devices[r.dstDev].site || r.dstDev; lines.push(L('ok', '<!DOCTYPE html>'), L('ok', '<html><head><title>' + site + '</title></head>'), L('ok', '<body><h1>' + site + '</h1><p>It works.</p></body></html>')); }
+        else if (r.stage === 'refused') lines.push(L('err', 'curl: (7) Failed to connect to ' + ip + ' port ' + port + ' after 4 ms: Connection refused'));
+        else lines.push(L('err', 'curl: (28) Failed to connect to ' + ip + ' port ' + port + ' after 21043 ms: Timed out'));
+      } else {
+        if (!r.ok) lines.push(L('err', 'WARNING: TCP connect to (' + ip + ' : ' + port + ') failed'));
+        [['ComputerName', ip], ['RemoteAddress', ip], ['RemotePort', port], ['InterfaceAlias', 'Ethernet'], ['SourceAddress', d.ip], ['TcpTestSucceeded', r.ok ? 'True' : 'False']]
+          .forEach(([k, v]) => lines.push(L(k === 'TcpTestSucceeded' ? (r.ok ? 'ok' : 'err') : 'out', pad(k, 17) + ': ' + v)));
+      }
+      lines.push(L('out', ''));
+      return { lines, ping: { from: this.name, to: ip, port, res: r } };
     }
     tracert(ip) {
       const tr = this.net.tracert(this.name, ip);
@@ -716,7 +1115,7 @@
     }
   }
 
-  const api = { Network, IOSShell, PCShell, isIP, isMask, shortIf, fmtVlans, parseVlanList, tokenize, HOSTS };
+  const api = { Network, IOSShell, PCShell, isIP, isMask, shortIf, fmtVlans, parseVlanList, tokenize, HOSTS, winMac };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Outage = api;
 })(typeof window !== 'undefined' ? window : globalThis);
