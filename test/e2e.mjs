@@ -51,10 +51,35 @@ const FIX = {
   p17: [['R1', ['en', 'conf t', 'access-list 10 permit 192.168.20.0 0.0.0.255']]],
   p18: [['R1', ['en', 'conf t', 'access-list 110 permit tcp any host 10.20.0.10 eq www']]],
   p19: [['R1', ['en', 'conf t', 'ip access-list extended GUEST-IN', 'no 20', '5 permit ip 192.168.50.0 0.0.0.255 host 10.30.0.40']]],
-  p20: [['R1', ['en', 'conf t', 'no access-list 15', 'access-list 15 permit 192.168.99.0 0.0.0.255']]]
+  p20: [['R1', ['en', 'conf t', 'no access-list 15', 'access-list 15 permit 192.168.99.0 0.0.0.255']]],
+  p21: [['R1', ['en', 'conf t', 'no ip dhcp excluded-address 192.168.10.1 192.168.10.254', 'ip dhcp excluded-address 192.168.10.1 192.168.10.20']], ['New-Laptop', ['ipconfig /renew']]],
+  p22: [['CORE', ['en', 'conf t', 'interface vlan 20', 'no shutdown']]],
+  p23: [['R1', ['en', 'conf t', 'int g0/1', 'ip helper-address 10.1.1.5']], ['Laptop', ['ipconfig /renew']]],
+  p24: [['R1', ['en', 'conf t', 'ip dhcp pool LAB', 'default-router 192.168.30.1']], ['Lab-Laptop', ['ipconfig /renew']]],
+  p25: [['CORE', ['en', 'conf t', 'interface vlan 30', 'no ip address', 'interface vlan 40', 'ip address 192.168.30.1 255.255.255.0', 'no shutdown']]],
+  p26: [['R2', ['en', 'conf t', 'router ospf 1', 'network 192.168.2.0 0.0.0.255 area 0']]],
+  p27: [['R2', ['en', 'conf t', 'router ospf 1', 'no passive-interface g0/1']]],
+  p28: [['R2', ['en', 'conf t', 'router ospf 1', 'no network 10.0.12.0 0.0.0.3 area 1', 'network 10.0.12.0 0.0.0.3 area 0']]],
+  p29: [['R2', ['en', 'conf t', 'int g0/1', 'no ip ospf hello-interval']]],
+  p30: [['R3', ['en', 'conf t', 'router ospf 1', 'no network 10.0.23.0 0.0.0.0 area 0', 'network 10.0.23.0 0.0.0.3 area 0']]],
+  p31: [['R1', ['en', 'conf t', 'ip route 0.0.0.0 0.0.0.0 203.0.113.1', 'end', 'copy running-config startup-config']]],
+  p32: [['R1', ['en', 'conf t', 'int g0/0', 'ip nat inside']]],
+  p33: [['R1', ['en', 'conf t', 'access-list 1 permit 192.168.10.0 0.0.0.255']]],
+  p34: [['R1', ['en', 'conf t', 'no ip nat inside source static 192.168.10.80 203.0.113.10', 'ip nat inside source static 192.168.10.50 203.0.113.10']]],
+  p35: [['R1', ['en', 'conf t', 'router ospf 1', 'default-information originate']]],
+  p36: [['SW1', ['en', 'conf t', 'int g0/1', 'speed auto', 'duplex auto']]],
+  p37: [['Printer', { ip: { addr: '192.168.10.40' } }]],
+  p38: [['R1', ['en', 'conf t', 'int g0/2', 'no ip access-group GUEST out', 'ip access-group GUEST in']]],
+  p39: [['R1', ['en', 'conf t', 'no ip route 10.10.0.0 255.255.0.0 10.0.13.30 250', 'ip route 10.10.0.0 255.255.0.0 10.0.13.3 250']]],
+  p40: [['R1', ['en', 'conf t', 'no ip route 192.168.2.0 255.255.255.0 10.0.99.2']]],
+  p41: [['Reception-PC', { ip: { addr: '192.168.10.21' } }]],
+  p42: [['SW1', ['en', 'conf t', 'int g0/1', 'switchport trunk allowed vlan add 30']], ['R1', ['en', 'conf t', 'interface g0/0.30', 'encapsulation dot1Q 30', 'ip address 192.168.30.1 255.255.255.0']]],
+  p43: [['R1', ['en', 'conf t', 'ip route 192.168.70.0 255.255.255.0 10.0.12.2']], ['Remote-Laptop', ['ipconfig /renew']]],
+  p44: [['SW1', ['en', 'conf t', 'int g0/1', 'switchport trunk native vlan 1']], ['SW2', ['en', 'conf t', 'int g0/1', 'switchport trunk allowed vlan add 20']]],
+  p45: [['R2', ['en', 'conf t', 'router ospf 1', 'no passive-interface g0/1']], ['R1', ['en', 'conf t', 'router ospf 1', 'default-information originate']]]
 };
 const N = Object.keys(FIX).length;
-const tab = (page, dev) => page.locator('#tabs .tab').filter({ hasText: new RegExp('^' + dev.replace(/[-]/g, '\\-') + '(router|switch|PC|server|printer|camera)$') });
+const tab = (page, dev) => page.locator('#tabs .tab').filter({ hasText: new RegExp('^' + dev.replace(/[-]/g, '\\-') + '(router|switch|L3 switch|ISP, read-only|PC|server|printer|camera)$') });
 async function solve(page, id, { hint = false } = {}) {
   await page.goto(BASE + '#' + id);
   await page.waitForSelector('#play:not([hidden])');
@@ -62,7 +87,11 @@ async function solve(page, id, { hint = false } = {}) {
   for (const [dev, cmds] of FIX[id]) {
     await tab(page, dev).click();
     if (cmds.ip) {
-      await page.click('#seg-ip'); await page.fill('#ip-gw', cmds.ip.gw); await page.click('#ipset button[type=submit]');
+      await page.click('#seg-ip');
+      if (cmds.ip.addr) await page.fill('#ip-addr', cmds.ip.addr);
+      if (cmds.ip.gw) await page.fill('#ip-gw', cmds.ip.gw);
+      await page.click('#ipset button[type=submit]');
+      await page.click('#seg-cmd');
       continue;
     }
     for (const c of cmds) { await page.fill('#cli', c); await page.press('#cli', 'Enter'); }
@@ -90,7 +119,7 @@ let fails = 0;
 const t = async (name, fn) => { try { await fn(); console.log('ok   ' + name); } catch (e) { fails++; console.log('FAIL ' + name + '\n     ' + e.message.split('\n')[0]); } };
 const browser = await chromium.launch();
 const errors = [];
-const ctx = async o => { const c = await browser.newContext(Object.assign({ reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } }, o || {})); await c.clock.setFixedTime(new Date('2026-11-08T10:00:00+10:00')); return c; };
+const ctx = async o => { const c = await browser.newContext(Object.assign({ reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } }, o || {})); await c.clock.setFixedTime(new Date('2026-11-13T10:00:00+10:00')); return c; };
 const watch = p => { p.on('pageerror', e => errors.push(e.message)); return p; };
 const shot = (p, f, o) => shots ? p.screenshot(Object.assign({ path: path.join(shots, f) }, o || {})) : null;
 
@@ -98,10 +127,10 @@ const a = watch(await (await ctx()).newPage());
 await a.goto(BASE);
 
 await t('rack: one switch per day, newest on top, five ports each', async () => {
-  assert.deepStrictEqual(await a.$$eval('.unit[data-day]', us => us.map(u => u.dataset.day)), ['4', '3', '2', '1']);
+  assert.deepStrictEqual(await a.$$eval('.unit[data-day]', us => us.map(u => u.dataset.day)), ['9', '8', '7', '6', '5', '4', '3', '2', '1']);
   assert.strictEqual(await a.locator('.rack .port').count(), N);
-  assert.match(await a.textContent('.unit[data-day="4"] .u-date'), /Today/);
-  assert.match(await a.textContent('#detail'), /Day 4.*Port 1[\s\S]*Desk Switch/);
+  assert.match(await a.textContent('.unit[data-day="9"] .u-date'), /Today/);
+  assert.match(await a.textContent('#detail'), /Day 9.*Port 1[\s\S]*Fat Fingers/);
   await shot(a, 'home.png', { fullPage: true });
 });
 await t('rack: picking a Day 1 port updates the detail', async () => {
@@ -144,6 +173,19 @@ await t('p13: SW1 console shows the port-security violation on open', async () =
   await tab(a, 'SW1').click();
   assert.match(await a.textContent('#screen'), /%PORT_SECURITY-2-PSECURE_VIOLATION: Security violation occurred, caused by MAC address 54bf\.6411\.2a7c/);
 });
+await t('p21: DHCP test point runs ipconfig /renew; Use DHCP button works', async () => {
+  await a.goto(BASE + '#p21'); await a.waitForSelector('#play:not([hidden])');
+  await a.click('#obj li:nth-child(1) button'); await a.waitForTimeout(60);
+  assert.match(await a.textContent('#screen'), /unable to contact your DHCP server/);
+  assert.match(await a.textContent('#wire-text'), /No DHCP server answered/);
+  await tab(a, 'Desk-PC').click(); await a.click('#seg-ip'); await a.click('#ip-dhcp');
+  assert.match(await a.textContent('#ip-msg'), /No DHCP server answered/, 'Desk-PC\'s old lease is excluded too');
+});
+await t('p31: the ISP router refuses enable', async () => {
+  await a.goto(BASE + '#p31'); await a.waitForSelector('#play:not([hidden])');
+  await tab(a, 'ISP').click(); await a.fill('#cli', 'enable'); await a.press('#cli', 'Enter');
+  assert.match(await a.textContent('#screen'), /Access denied/);
+});
 await t('p18: web and SSH test points run curl and tnc; SSH counts as passing when blocked', async () => {
   await a.goto(BASE + '#p18'); await a.waitForSelector('#play:not([hidden])');
   assert.deepStrictEqual(await a.$$eval('#obj .t-cmd', e => e.map(x => x.textContent)), ['Staff-PC: curl http://10.20.0.10', 'Dev-PC: ping 10.20.0.10', 'Staff-PC: tnc 10.20.0.10 -port 22 should fail']);
@@ -169,7 +211,7 @@ await t(`player 1 fixes all ${N} outages through the UI`, async () => {
 });
 await t('rack shows every day fixed', async () => {
   await a.goto(BASE); await a.waitForSelector('.unit');
-  assert.deepStrictEqual(await a.$$eval('.unit[data-day] .u-count', e => e.map(x => x.textContent)), ['5/5 up', '5/5 up', '5/5 up', '5/5 up']);
+  assert.deepStrictEqual(await a.$$eval('.unit[data-day] .u-count', e => e.map(x => x.textContent)), Array(9).fill('5/5 up'));
   assert.strictEqual(await a.locator('.rack .port .led-r').count(), 0);
   assert.match(await a.getAttribute('#brand-led', 'class'), /led-g/);
 });
@@ -184,7 +226,7 @@ await t('player 2 posts a Day 2 run with an escalation', async () => {
 await t('leaderboard: all days', async () => {
   const rows = await b.$$eval('table.lb tbody tr', rs => rs.map(r => Array.from(r.cells).map(c => c.textContent.trim())));
   assert.strictEqual(rows[0][1], 'Zach'); assert.strictEqual(rows[0][2], `${N}/${N}`); assert.strictEqual(rows[1][2], `1/${N}`);
-  assert.deepStrictEqual(await b.$$eval('table.lb thead th small', e => e.map(x => x.textContent)), ['Day 4', 'Day 3', 'Day 2', 'Day 1']);
+  assert.deepStrictEqual(await b.$$eval('table.lb thead th small', e => e.map(x => x.textContent)), ['Day 9', 'Day 8', 'Day 7', 'Day 6', 'Day 5', 'Day 4', 'Day 3', 'Day 2', 'Day 1']);
   await shot(b, 'board-all.png', { fullPage: true });
 });
 await t('leaderboard: one day, then one outage', async () => {

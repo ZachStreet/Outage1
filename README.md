@@ -31,9 +31,16 @@ The home page is a rack with one switch per day, newest on top. Each switch hold
 
 A day appears on its date, in each player's own time zone, so you can add several days in advance. The leaderboard picks up new outages automatically.
 
-What the simulator supports: access ports, VLANs, 802.1Q trunks (allowed lists, native VLAN, DTP auto/desirable, CDP mismatch logs), speed and duplex negotiation, port security and BPDU Guard with err-disabled ports, router interfaces and router-on-a-stick subinterfaces, static and default routes with longest-prefix matching and routing loops, standard, extended and named ACLs, ARP, ping, tracert, `curl` and `tnc` (TCP port tests) on PCs, and PC IP settings.
+What the simulator supports: access ports, VLANs, 802.1Q trunks (allowed lists, native VLAN, DTP auto/desirable, CDP mismatch logs), speed and duplex negotiation, port security and BPDU Guard with err-disabled ports, router interfaces and router-on-a-stick subinterfaces, layer-3 switches with SVIs and `ip routing`, static routes with administrative distance (floating statics), OSPF (network statements, areas, passive interfaces, hello/dead timers, `default-information originate`), standard, extended and named ACLs, DHCP servers, pools, exclusions and relays (`ip helper-address`), NAT/PAT and static NAT, ARP and MAC address tables, routing loops, ping, tracert, `curl` and `tnc` on PCs, and PC IP settings (static or DHCP).
 
-Test points can be a ping, a TCP port (`port: 80` runs `curl`, other ports run `tnc`), and can be marked `blocked: true` when the traffic must stay blocked. Use those to stop lazy fixes, like deleting an ACL, from passing. `boot` adds log lines a device printed before the player arrived.
+Test points can be:
+- a ping: `{ from, to }`
+- a TCP port: add `port: 80` (runs `curl`) or another port (runs `tnc`)
+- traffic that must stay blocked: add `blocked: true`, so lazy fixes like deleting an ACL don't pass
+- a ping that must reach a particular device: add `dev: 'File-Server'` (for duplicate addresses)
+- a DHCP lease: `{ from, dhcp: true }` (runs `ipconfig /renew`)
+
+Puzzle extras: `boot` adds log lines a device printed before the player arrived; `locked: true` makes a device read-only (an ISP router); `cut: true` on a link models a cable fault the player can't fix.
 
 ## Who's playing: the stats page
 

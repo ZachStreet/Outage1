@@ -20,11 +20,72 @@
   const net = (addr, wc) => ({ addr, wc });
   const H = addr => ({ addr, wc: '0.0.0.0' });
   const M30 = '255.255.255.252';
+  const G = n => 'GigabitEthernet0/' + n, F = n => 'FastEthernet0/' + n, F0 = 'FastEthernet0';
+  // A layer-3 switch: a switch with SVIs (gateway interfaces named Vlan10 and so on) and ip routing on.
+  function l3sw(x, y, role, vlans, ports, svis, extra) {
+    const d = sw(x, y, role, vlans, ports);
+    d.l3 = true; d.ipRouting = true; d.ifaces = {};
+    Object.keys(svis || {}).forEach(v => { d.ifaces['Vlan' + v] = Object.assign({ ip: null, mask: null, shutdown: false }, svis[v]); });
+    return Object.assign(d, extra || {});
+  }
+  // DHCP clients: one with no lease yet (Windows gives itself a 169.254 address), and one holding a lease.
+  const apipa = (type, x, y, ip, more) => host(type, x, y, ip, '255.255.0.0', null, Object.assign({ dhcp: true, apipa: true }, more || {}));
+  const leased = (type, x, y, ip, mask, gw, server, sid, more) => host(type, x, y, ip, mask, gw, Object.assign({ dhcp: true, lease: server, leaseIP: sid }, more || {}));
+  const ospf = (rid, networks, passive) => ({ pid: 1, rid, networks: networks.map(([n, wc, area]) => ({ net: n, wc, area })), passive: passive || [] });
+  // Day 7's internet edge: office LAN, R1 doing PAT, an ISP router you can look at but not change, and a web server.
+  function edge(o) {
+    const g0 = Object.assign({ ip: '192.168.10.1', mask: M24, natIn: true, description: 'Office LAN' }, o.g0 || {});
+    if (!g0.natIn) delete g0.natIn;
+    const R1 = Object.assign(rt(480, 200, 'Edge', { [G(0)]: g0, [G(1)]: { ip: '203.0.113.2', mask: o.shop ? '255.255.255.248' : M30, natOut: true, description: 'ISP' } },
+      o.routes || [{ net: '0.0.0.0', mask: '0.0.0.0', nh: '203.0.113.1' }]), {
+      acls: { 1: { type: 'std', entries: [{ seq: 10, action: 'permit', src: net(o.acl || '192.168.10.0', '0.0.0.255') }] } },
+      nat: { pat: [{ acl: '1', ifn: G(1) }], statics: o.shop ? [{ local: '192.168.10.80', global: '203.0.113.10' }] : [] }
+    });
+    const d = {
+      'Office-PC': host('pc', 90, 110, '192.168.10.21', M24, '192.168.10.1'),
+      'Office-PC2': host('pc', 90, 290, '192.168.10.22', M24, '192.168.10.1'),
+      SW1: sw(280, 200, 'Office'),
+      R1,
+      ISP: Object.assign(rt(680, 200, 'Provider', Object.assign({ [G(0)]: { ip: '203.0.113.1', mask: o.shop ? '255.255.255.248' : M30 }, [G(1)]: { ip: '198.51.100.1', mask: M24 } }, o.shop ? { [G(2)]: { ip: '192.0.2.1', mask: M24 } } : {}),
+        o.shop ? [{ net: '203.0.113.8', mask: '255.255.255.248', nh: '203.0.113.2' }] : []), { locked: true }),
+      Web: host('server', 845, 110, '198.51.100.10', M24, '198.51.100.1', { services: [80], site: 'example.net' })
+    };
+    if (o.shop) {
+      d['Shop-Server'] = host('server', 90, 290, '192.168.10.50', M24, '192.168.10.1', { services: [80], site: 'Shop' });
+      delete d['Office-PC2'];
+      d.Customer = host('pc', 845, 290, '192.0.2.77', M24, '192.0.2.1');
+    }
+    return d;
+  }
+  const edgeLinks = o => [link(o && o.shop ? 'Shop-Server' : 'Office-PC2', F0, 'SW1', F(2)), link('Office-PC', F0, 'SW1', F(1)), link('SW1', G(1), 'R1', G(0)), link('R1', G(1), 'ISP', G(0)), link('ISP', G(1), 'Web', F0)].concat(o && o.shop ? [link('ISP', G(2), 'Customer', F0)] : []);
+  const edgeLabels = () => [{ x: 280, y: 52, t: '192.168.10.0/24' }, { x: 580, y: 120, t: 'Public' }, { x: 760, y: 45, t: 'Internet' }];
+  // Day 7 and 9: HQ edge router running OSPF with a branch router.
+  function edgeOspf(o) {
+    return {
+      'Branch-PC': host('pc', 70, 200, '192.168.20.21', M24, '192.168.20.1'),
+      R2: Object.assign(rt(235, 200, 'Branch', { [G(0)]: { ip: '192.168.20.1', mask: M24 }, [G(1)]: { ip: '10.0.12.2', mask: M30 } }),
+        { ospf: ospf('2.2.2.2', [['10.0.12.0', '0.0.0.3', 0], ['192.168.20.0', '0.0.0.255', 0]], o.passiveWan ? [G(0), G(1)] : [G(0)]) }),
+      'HQ-PC': host('pc', 445, 62, '192.168.10.21', M24, '192.168.10.1'),
+      R1: Object.assign(rt(445, 200, 'HQ edge', {
+        [G(0)]: { ip: '192.168.10.1', mask: M24, natIn: true, description: 'HQ LAN' },
+        [G(2)]: { ip: '10.0.12.1', mask: M30, natIn: true, description: 'Branch' },
+        [G(1)]: { ip: '203.0.113.2', mask: M30, natOut: true, description: 'ISP' }
+      }, [{ net: '0.0.0.0', mask: '0.0.0.0', nh: '203.0.113.1' }]), {
+        acls: { 1: { type: 'std', entries: [{ seq: 10, action: 'permit', src: net('192.168.0.0', '0.0.255.255') }] } },
+        nat: { pat: [{ acl: '1', ifn: G(1) }], statics: [] },
+        ospf: ospf('1.1.1.1', [['192.168.10.0', '0.0.0.255', 0], ['10.0.12.0', '0.0.0.3', 0]], [G(0)])
+      }),
+      ISP: Object.assign(rt(650, 200, 'Provider', { [G(0)]: { ip: '203.0.113.1', mask: M30 }, [G(1)]: { ip: '198.51.100.1', mask: M24 } }), { locked: true }),
+      Web: host('server', 835, 200, '198.51.100.10', M24, '198.51.100.1', { services: [80], site: 'example.net' })
+    };
+  }
+  const edgeOspfLinks = () => [link('Branch-PC', F0, 'R2', G(0)), link('R2', G(1), 'R1', G(2)), link('HQ-PC', F0, 'R1', G(0)), link('R1', G(1), 'ISP', G(0)), link('ISP', G(1), 'Web', F0)];
+  const edgeOspfLabels = () => [{ x: 150, y: 120, t: 'Branch' }, { x: 340, y: 290, t: 'OSPF area 0' }, { x: 745, y: 120, t: 'Internet' }];
   const link = (a, ai, b, bi) => ({ a, ai, b, bi });
   const M24 = '255.255.255.0';
 
   // Each day is one switch in the rack. A day appears on its date (the player's local time), so you can add days in advance.
-  const DAYS = { 1: '2026-11-02', 2: '2026-11-03', 3: '2026-11-07', 4: '2026-11-08' };
+  const DAYS = { 1: '2026-11-02', 2: '2026-11-03', 3: '2026-11-07', 4: '2026-11-08', 5: '2026-11-09', 6: '2026-11-10', 7: '2026-11-11', 8: '2026-11-12', 9: '2026-11-13' };
 
   const PUZZLES = [
     {
@@ -772,7 +833,681 @@
         'On R1: `en`, `conf t`, `no access-list 15`, then `access-list 15 permit 192.168.99.0 0.0.0.255`.'
       ],
       explain: 'A wildcard mask is the inverse of a subnet mask: a /24 is 0.0.0.255. Typing a subnet mask into an ACL is a classic mistake, and IOS accepts it without complaint. Two more IOS habits worth knowing: `no access-list 15 permit …` deletes the entire list, not one line, and an applied ACL that doesn’t exist permits everything, which is why Staff must be tested too.'
+    },
+    // ---------------- Day 5 ----------------
+    {
+      id: 'p21', day: 5, num: 21, diff: 1, title: 'No Vacancy', topics: ['DHCP'],
+      teaser: 'Old PCs are fine. New laptops get a 169.254 address.',
+      ticket: { id: 'INC-2140', pri: 'P3', opened: '08:35' },
+      story: 'Last night someone reserved the first twenty addresses in the office DHCP pool for new printers. This morning every PC that already had an address is fine, but the new laptops come up with a 169.254 address and can’t reach anything.',
+      start: 'New-Laptop',
+      devices: {
+        'New-Laptop': apipa('pc', 100, 110, '169.254.88.14', { mac: '3c22.fb10.0a01' }),
+        'Desk-PC': leased('pc', 100, 290, '192.168.10.21', M24, '192.168.10.1', 'R1', '192.168.10.1', { mac: '3c22.fb10.0b02' }),
+        SW1: sw(320, 200, 'Office'),
+        R1: Object.assign(rt(560, 200, 'Edge', { [G(0)]: { ip: '192.168.10.1', mask: M24 }, [G(1)]: { ip: '10.1.1.1', mask: M24 } }), {
+          dhcp: { pools: { STAFF: { network: '192.168.10.0', mask: M24, router: '192.168.10.1', dns: '10.1.1.53' } }, excluded: [['192.168.10.1', '192.168.10.254']], bindings: { '192.168.10.21': '3c22.fb10.0b02' } }
+        }),
+        'Mail-Server': host('server', 790, 200, '10.1.1.25', M24, '10.1.1.1')
+      },
+      links: [link('New-Laptop', F0, 'SW1', F(1)), link('Desk-PC', F0, 'SW1', F(2)), link('SW1', G(1), 'R1', G(0)), link('R1', G(1), 'Mail-Server', F0)],
+      labels: [{ x: 320, y: 60, t: '192.168.10.0/24' }, { x: 675, y: 120, t: '10.1.1.0/24' }],
+      objectives: [
+        { from: 'New-Laptop', dhcp: true, text: 'New-Laptop gets an address from DHCP' },
+        { from: 'New-Laptop', to: '10.1.1.25', text: 'New-Laptop can reach Mail-Server' },
+        { from: 'Desk-PC', to: '10.1.1.25', text: 'Desk-PC can still reach Mail-Server' }
+      ],
+      hints: [
+        'A 169.254 address means no DHCP server answered, so Windows made one up. R1 is the DHCP server here. Start with `show ip dhcp pool` on R1.',
+        'The pool holds 254 addresses and all 254 are excluded. The range was meant to be .1 to .20, but someone typed .254. PCs that already had a lease keep it, which is why only new laptops are stuck.',
+        'On R1: `en`, `conf t`, `no ip dhcp excluded-address 192.168.10.1 192.168.10.254`, then `ip dhcp excluded-address 192.168.10.1 192.168.10.20`. On New-Laptop: `ipconfig /renew`.'
+      ],
+      explain: 'Excluded addresses are ones the DHCP server must never hand out, usually for routers, printers and servers with fixed addresses. Exclude the whole subnet and the server has nothing left to offer, so new clients fall back to a 169.254 link-local address. Existing leases carry on until they need renewing, which makes this kind of mistake easy to miss.'
+    },
+    {
+      id: 'p22', day: 5, num: 22, diff: 1, title: 'Lights Off Upstairs', topics: ['Layer-3 switching', 'SVIs'],
+      teaser: 'Sales can print. Sales can’t reach anything else.',
+      ticket: { id: 'INC-2143', pri: 'P2', opened: '09:10' },
+      story: 'Over the weekend someone tidied up the core switch’s config. This morning the sales team can still print to their own printer, but they can’t reach the CRM server or anything else outside their floor.',
+      start: 'Sales-PC',
+      devices: {
+        'Staff-PC': host('pc', 150, 95, '192.168.10.21', M24, '192.168.10.1'),
+        'CRM-Server': host('server', 750, 95, '192.168.10.50', M24, '192.168.10.1', { services: [80], site: 'CRM' }),
+        CORE: l3sw(450, 195, 'Layer-3 core', { 1: 'default', 10: 'STAFF', 20: 'SALES' }, { [F(1)]: { vlan: 10 }, [F(2)]: { vlan: 10 }, [F(3)]: { vlan: 20 }, [F(4)]: { vlan: 20 } },
+          { 10: { ip: '192.168.10.1', mask: M24 }, 20: { ip: '192.168.20.1', mask: M24, shutdown: true } }),
+        'Sales-PC': host('pc', 150, 295, '192.168.20.21', M24, '192.168.20.1'),
+        'Sales-Printer': host('printer', 750, 295, '192.168.20.40', M24, '192.168.20.1')
+      },
+      links: [link('Staff-PC', F0, 'CORE', F(1)), link('CRM-Server', F0, 'CORE', F(2)), link('Sales-PC', F0, 'CORE', F(3)), link('Sales-Printer', F0, 'CORE', F(4))],
+      labels: [{ x: 450, y: 40, t: 'STAFF VLAN 10: 192.168.10.0/24' }, { x: 450, y: 372, t: 'SALES VLAN 20: 192.168.20.0/24' }],
+      objectives: [
+        { from: 'Sales-PC', to: '192.168.10.50', text: 'Sales-PC can reach CRM-Server' },
+        { from: 'Sales-PC', to: '192.168.20.40', text: 'Sales-PC can still reach Sales-Printer' },
+        { from: 'Staff-PC', to: '192.168.10.50', text: 'Staff-PC can still reach CRM-Server' }
+      ],
+      hints: [
+        'Sales can reach things in their own VLAN, but not beyond it. Their gateway is 192.168.20.1, on the core switch. Run `show ip interface brief` on CORE.',
+        'Interface Vlan20, the sales VLAN’s gateway, is administratively down.',
+        'On CORE: `en`, `conf t`, `interface vlan 20`, `no shutdown`.'
+      ],
+      explain: 'On a layer-3 switch, each VLAN’s default gateway is a switched virtual interface (SVI), named after the VLAN. Shut it down and the VLAN is cut off from everything outside it, while traffic inside the VLAN, like printing to the printer next door, carries on as normal.'
+    },
+    {
+      id: 'p23', day: 5, num: 23, diff: 2, title: 'Far From Home', topics: ['DHCP relay'],
+      teaser: 'Level 6 gets addresses from the server. Level 5 doesn’t.',
+      ticket: { id: 'INC-2147', pri: 'P2', opened: '08:50' },
+      story: 'The company took over Level 5 this week. Its network was set up yesterday like Level 6’s, and DC-Server already has a DHCP scope for it. Laptops on Level 6 get addresses fine. Laptops on Level 5 get 169.254 addresses.',
+      start: 'Laptop',
+      devices: {
+        'DC-Server': host('server', 110, 110, '10.1.1.5', M24, '10.1.1.1', { dhcpd: {
+          pools: { LEVEL5: { network: '192.168.50.0', mask: M24, router: '192.168.50.1', dns: '10.1.1.5' }, LEVEL6: { network: '192.168.60.0', mask: M24, router: '192.168.60.1', dns: '10.1.1.5' } },
+          excluded: [['192.168.50.1', '192.168.50.20'], ['192.168.60.1', '192.168.60.20']], bindings: { '192.168.60.21': 'd0bf.9c44.6021' } } }),
+        R1: rt(380, 200, 'Core', {
+          [G(0)]: { ip: '10.1.1.1', mask: M24, description: 'Datacentre' },
+          [G(1)]: { ip: '192.168.50.1', mask: M24, description: 'Level 5' },
+          [G(2)]: { ip: '192.168.60.1', mask: M24, description: 'Level 6', helper: ['10.1.1.5'] }
+        }),
+        SW5: sw(620, 110, 'Level 5'),
+        Laptop: apipa('pc', 830, 110, '169.254.21.140', { mac: 'd0bf.9c44.5021' }),
+        SW6: sw(620, 290, 'Level 6'),
+        'Level6-PC': leased('pc', 830, 290, '192.168.60.21', M24, '192.168.60.1', 'DC-Server', '10.1.1.5', { mac: 'd0bf.9c44.6021' })
+      },
+      links: [link('DC-Server', F0, 'R1', G(0)), link('R1', G(1), 'SW5', G(1)), link('Laptop', F0, 'SW5', F(1)), link('R1', G(2), 'SW6', G(1)), link('Level6-PC', F0, 'SW6', F(1))],
+      labels: [{ x: 245, y: 290, t: '10.1.1.0/24' }, { x: 725, y: 45, t: '192.168.50.0/24' }, { x: 720, y: 372, t: '192.168.60.0/24' }],
+      objectives: [
+        { from: 'Laptop', dhcp: true, text: 'Laptop on Level 5 gets an address from DHCP' },
+        { from: 'Laptop', to: '10.1.1.5', text: 'Laptop can reach DC-Server' },
+        { from: 'Level6-PC', to: '10.1.1.5', text: 'Level6-PC can still reach DC-Server' }
+      ],
+      hints: [
+        'DHCP starts with a broadcast, and routers don’t forward broadcasts. So how does Level 6 reach a DHCP server on another subnet? Compare R1’s Level 5 and Level 6 interfaces in `show running-config`.',
+        'Level 6’s interface has `ip helper-address 10.1.1.5`, which relays DHCP broadcasts to the server as unicast. Level 5’s interface has nothing, so its broadcasts die at R1.',
+        'On R1: `en`, `conf t`, `int g0/1`, `ip helper-address 10.1.1.5`. Then on Laptop: `ipconfig /renew`.'
+      ],
+      explain: 'A DHCP request is a broadcast, and routers stop broadcasts. A DHCP relay (`ip helper-address`) on the client’s gateway interface turns it into a unicast to the server, stamped with the gateway’s address so the server knows which scope to use. Every subnet without a local DHCP server needs one.'
+    },
+    {
+      id: 'p24', day: 5, num: 24, diff: 2, title: 'Wrong Way Home', topics: ['DHCP options', 'Default gateway'],
+      teaser: 'Every laptop gets an address, and nothing outside the lab works.',
+      ticket: { id: 'INC-2151', pri: 'P3', opened: '10:20' },
+      story: 'The lab got its own DHCP pool on R1 yesterday. Every laptop gets an address and they can all see each other, but nothing outside the lab works: no Git server, nothing.',
+      start: 'Lab-Laptop',
+      devices: {
+        'Lab-Laptop': leased('pc', 100, 110, '192.168.30.21', M24, '192.168.30.254', 'R1', '192.168.30.1', { mac: '8c16.45aa.3021' }),
+        'Lab-PC2': leased('pc', 100, 290, '192.168.30.22', M24, '192.168.30.254', 'R1', '192.168.30.1', { mac: '8c16.45aa.3022' }),
+        SW1: sw(320, 200, 'Lab'),
+        R1: Object.assign(rt(560, 200, 'Lab router', { [G(0)]: { ip: '192.168.30.1', mask: M24 }, [G(1)]: { ip: '10.2.2.1', mask: M24 } }), {
+          dhcp: { pools: { LAB: { network: '192.168.30.0', mask: M24, router: '192.168.30.254', dns: '10.2.2.53' } }, excluded: [['192.168.30.1', '192.168.30.20']], bindings: { '192.168.30.21': '8c16.45aa.3021', '192.168.30.22': '8c16.45aa.3022' } }
+        }),
+        'Git-Server': host('server', 790, 200, '10.2.2.20', M24, '10.2.2.1', { services: [80], site: 'Git' })
+      },
+      links: [link('Lab-Laptop', F0, 'SW1', F(1)), link('Lab-PC2', F0, 'SW1', F(2)), link('SW1', G(1), 'R1', G(0)), link('R1', G(1), 'Git-Server', F0)],
+      labels: [{ x: 320, y: 60, t: '192.168.30.0/24' }, { x: 675, y: 120, t: '10.2.2.0/24' }],
+      objectives: [
+        { from: 'Lab-Laptop', to: '10.2.2.20', text: 'Lab-Laptop can reach Git-Server' },
+        { from: 'Lab-Laptop', to: '192.168.30.22', text: 'Lab-Laptop can still reach Lab-PC2' }
+      ],
+      hints: [
+        'Compare `ipconfig` on Lab-Laptop with R1’s LAN address in `show ip interface brief`.',
+        'The laptops’ default gateway is 192.168.30.254, an address nobody has. They got it from DHCP, so look at the LAB pool in R1’s `show running-config`.',
+        'On R1: `en`, `conf t`, `ip dhcp pool LAB`, `default-router 192.168.30.1`. Then on Lab-Laptop: `ipconfig /renew` to pick up the new gateway.'
+      ],
+      explain: 'DHCP hands out more than an address: the pool’s `default-router` becomes every client’s default gateway. Get it wrong and clients work fine inside their subnet but can’t leave it. Fixing the pool isn’t enough on its own, because clients only learn the new gateway when they renew their lease.'
+    },
+    {
+      id: 'p25', day: 5, num: 25, diff: 3, title: 'Moving House', topics: ['SVIs', 'VLANs'],
+      teaser: 'The printers moved VLANs. Their gateway didn’t.',
+      ticket: { id: 'INC-2156', pri: 'P2', opened: '07:55' },
+      story: 'Last night the printers moved from VLAN 30 to a new VLAN 40. Their switch ports were moved, VLAN 30 was deleted, and the printers kept their addresses. This morning nobody can print, and the printers can’t even reach their own gateway.',
+      start: 'Staff-PC',
+      devices: {
+        'Staff-PC': host('pc', 150, 95, '192.168.10.21', M24, '192.168.10.1'),
+        'File-Server': host('server', 750, 95, '192.168.10.50', M24, '192.168.10.1'),
+        CORE: l3sw(450, 195, 'Layer-3 core', { 1: 'default', 10: 'STAFF', 40: 'PRINTERS' }, { [F(1)]: { vlan: 10 }, [F(2)]: { vlan: 10 }, [F(3)]: { vlan: 40 }, [F(4)]: { vlan: 40 } },
+          { 10: { ip: '192.168.10.1', mask: M24 }, 30: { ip: '192.168.30.1', mask: M24 } }),
+        'Office-Printer': host('printer', 150, 295, '192.168.30.40', M24, '192.168.30.1'),
+        'Label-Printer': host('printer', 750, 295, '192.168.30.41', M24, '192.168.30.1')
+      },
+      links: [link('Staff-PC', F0, 'CORE', F(1)), link('File-Server', F0, 'CORE', F(2)), link('Office-Printer', F0, 'CORE', F(3)), link('Label-Printer', F0, 'CORE', F(4))],
+      labels: [{ x: 450, y: 40, t: 'STAFF VLAN 10: 192.168.10.0/24' }, { x: 450, y: 372, t: 'PRINTERS VLAN 40: 192.168.30.0/24' }],
+      objectives: [
+        { from: 'Staff-PC', to: '192.168.30.40', text: 'Staff-PC can reach Office-Printer' },
+        { from: 'Label-Printer', to: '192.168.30.1', text: 'Label-Printer can reach its gateway' },
+        { from: 'Staff-PC', to: '192.168.10.50', text: 'Staff-PC can still reach File-Server' }
+      ],
+      hints: [
+        'Run `show ip interface brief` on CORE. The printers’ gateway, 192.168.30.1, lives on interface Vlan30. Look at its state.',
+        'VLAN 30 no longer exists, so its SVI is down/down: an SVI only comes up while its VLAN has at least one active port. The printer subnet needs to move to an SVI for VLAN 40. Take the address off Vlan30 first, or IOS rejects it as an overlap.',
+        'On CORE: `en`, `conf t`, `interface vlan 30`, `no ip address`, then `interface vlan 40`, `ip address 192.168.30.1 255.255.255.0`, `no shutdown`.'
+      ],
+      explain: 'An SVI follows its VLAN: it’s only up while the VLAN exists and has at least one active port (Cisco calls this autostate). Moving devices to a new VLAN means moving the gateway to that VLAN’s SVI too. New SVIs start shut down, so they need a `no shutdown`.'
+    },
+
+    // ---------------- Day 6 ----------------
+    {
+      id: 'p26', day: 6, num: 26, diff: 1, title: 'Unadvertised', topics: ['OSPF', 'Network statements'],
+      teaser: 'The routers are OSPF neighbours. The branch LAN is still invisible.',
+      ticket: { id: 'INC-2160', pri: 'P3', opened: '09:30' },
+      story: 'The branch router R2 was moved onto OSPF yesterday. It formed a neighbour relationship with HQ straight away, and the branch can reach HQ. But nobody at HQ can reach anything at the branch.',
+      start: 'HQ-PC',
+      devices: {
+        'HQ-PC': host('pc', 90, 200, '192.168.1.20', M24, '192.168.1.1'),
+        R1: Object.assign(rt(310, 200, 'HQ', { [G(0)]: { ip: '192.168.1.1', mask: M24 }, [G(1)]: { ip: '10.0.12.1', mask: M30 } }), { ospf: ospf('1.1.1.1', [['192.168.1.0', '0.0.0.255', 0], ['10.0.12.0', '0.0.0.3', 0]], [G(0)]) }),
+        R2: Object.assign(rt(570, 200, 'Branch', { [G(1)]: { ip: '10.0.12.2', mask: M30 }, [G(0)]: { ip: '192.168.2.1', mask: M24 } }), { ospf: ospf('2.2.2.2', [['10.0.12.0', '0.0.0.3', 0]], [G(0)]) }),
+        'Branch-PC': host('pc', 810, 200, '192.168.2.20', M24, '192.168.2.1')
+      },
+      links: [link('HQ-PC', F0, 'R1', G(0)), link('R1', G(1), 'R2', G(1)), link('R2', G(0), 'Branch-PC', F0)],
+      labels: [{ x: 200, y: 120, t: '192.168.1.0/24' }, { x: 440, y: 120, t: 'OSPF area 0' }, { x: 690, y: 120, t: '192.168.2.0/24' }],
+      objectives: [
+        { from: 'HQ-PC', to: '192.168.2.20', text: 'HQ-PC can reach Branch-PC' },
+        { from: 'HQ-PC', to: '10.0.12.2', text: 'HQ-PC can still reach R2' }
+      ],
+      hints: [
+        'R1 and R2 are neighbours (`show ip ospf neighbor`), but look at R1’s routing table. Is there a route to 192.168.2.0/24?',
+        'OSPF only advertises networks covered by a `network` statement. R2’s config covers the link to R1, but not its own LAN. Compare `show ip protocols` on both routers.',
+        'On R2: `en`, `conf t`, `router ospf 1`, `network 192.168.2.0 0.0.0.255 area 0`.'
+      ],
+      explain: 'A `network` statement does two things: it turns OSPF on for matching interfaces, and it advertises their subnets. R2 never matched its LAN, so OSPF never told anyone about it. The LAN interface is passive, which is right: passive interfaces send no hellos but are still advertised, once a network statement covers them.'
+    },
+    {
+      id: 'p27', day: 6, num: 27, diff: 2, title: 'Passive Aggressive', topics: ['OSPF', 'Passive interfaces'],
+      teaser: 'A new branch router, built from the template, has no neighbours.',
+      ticket: { id: 'INC-2163', pri: 'P2', opened: '08:15' },
+      story: 'A new branch router was built from the standard template, which makes interfaces passive so OSPF doesn’t chatter onto user LANs. The branch can’t reach HQ, and HQ can’t reach the branch.',
+      start: 'Branch-PC',
+      devices: {
+        'HQ-Server': host('server', 90, 200, '192.168.1.10', M24, '192.168.1.1'),
+        R1: Object.assign(rt(310, 200, 'HQ', { [G(0)]: { ip: '192.168.1.1', mask: M24 }, [G(1)]: { ip: '10.0.12.1', mask: M30 } }), { ospf: ospf('1.1.1.1', [['192.168.1.0', '0.0.0.255', 0], ['10.0.12.0', '0.0.0.3', 0]], [G(0)]) }),
+        R2: Object.assign(rt(570, 200, 'Branch', { [G(1)]: { ip: '10.0.12.2', mask: M30 }, [G(0)]: { ip: '192.168.2.1', mask: M24 } }), { ospf: ospf('2.2.2.2', [['10.0.12.0', '0.0.0.3', 0], ['192.168.2.0', '0.0.0.255', 0]], [G(0), G(1)]) }),
+        'Branch-PC': host('pc', 810, 200, '192.168.2.20', M24, '192.168.2.1')
+      },
+      links: [link('HQ-Server', F0, 'R1', G(0)), link('R1', G(1), 'R2', G(1)), link('R2', G(0), 'Branch-PC', F0)],
+      labels: [{ x: 200, y: 120, t: '192.168.1.0/24' }, { x: 440, y: 120, t: 'OSPF area 0' }, { x: 690, y: 120, t: '192.168.2.0/24' }],
+      objectives: [
+        { from: 'Branch-PC', to: '192.168.1.10', text: 'Branch-PC can reach HQ-Server' },
+        { from: 'HQ-Server', to: '192.168.2.20', text: 'HQ-Server can reach Branch-PC' }
+      ],
+      hints: [
+        'Start with `show ip ospf neighbor` on both routers. Then `show ip ospf interface g0/1` on R2.',
+        'R2’s WAN interface, Gi0/1, is passive. A passive interface sends no hellos, so R1 and R2 never become neighbours and never swap routes.',
+        'On R2: `en`, `conf t`, `router ospf 1`, `no passive-interface g0/1`.'
+      ],
+      explain: 'Passive interfaces are good practice on user-facing LANs: the subnet is still advertised, but no OSPF hellos leak onto it. On a link to another router, passive means no neighbour, no routes. The template’s second step, un-passiving the uplink, was the one that got missed.'
+    },
+    {
+      id: 'p28', day: 6, num: 28, diff: 2, title: 'Wrong Area', topics: ['OSPF', 'Areas'],
+      teaser: 'R1 keeps logging errors, and the branch is cut off.',
+      ticket: { id: 'INC-2167', pri: 'P2', opened: '09:05' },
+      story: 'The branch is meant to be its own OSPF area, area 1, connected to the backbone, area 0, at R2. R2 was configured last night. Since then the branch is cut off from HQ, and R1’s console keeps logging errors.',
+      start: 'HQ-PC',
+      devices: {
+        'HQ-PC': host('pc', 90, 200, '192.168.1.20', M24, '192.168.1.1'),
+        R1: Object.assign(rt(310, 200, 'HQ (area 0)', { [G(0)]: { ip: '192.168.1.1', mask: M24 }, [G(1)]: { ip: '10.0.12.1', mask: M30 } }), { ospf: ospf('1.1.1.1', [['192.168.1.0', '0.0.0.255', 0], ['10.0.12.0', '0.0.0.3', 0]], [G(0)]) }),
+        R2: Object.assign(rt(570, 200, 'Branch ABR', { [G(1)]: { ip: '10.0.12.2', mask: M30 }, [G(0)]: { ip: '192.168.2.1', mask: M24 } }), { ospf: ospf('2.2.2.2', [['10.0.12.0', '0.0.0.3', 1], ['192.168.2.0', '0.0.0.255', 1]], [G(0)]) }),
+        'Branch-PC': host('pc', 810, 200, '192.168.2.20', M24, '192.168.2.1')
+      },
+      links: [link('HQ-PC', F0, 'R1', G(0)), link('R1', G(1), 'R2', G(1)), link('R2', G(0), 'Branch-PC', F0)],
+      labels: [{ x: 200, y: 120, t: 'Area 0' }, { x: 440, y: 120, t: '10.0.12.0/30' }, { x: 690, y: 120, t: 'Area 1' }],
+      objectives: [
+        { from: 'HQ-PC', to: '192.168.2.20', text: 'HQ-PC can reach Branch-PC' },
+        { from: 'Branch-PC', to: '192.168.1.20', text: 'Branch-PC can reach HQ-PC' }
+      ],
+      hints: [
+        'Read R1’s console log. Then compare `show ip protocols` (or `show ip ospf interface brief`) on both routers, looking at the area of the link between them.',
+        'Both ends of a link must be in the same area. R1 put 10.0.12.0/30 in area 0, R2 put it in area 1. R2 is meant to sit on the border: its WAN link in area 0, its LAN in area 1.',
+        'On R2: `en`, `conf t`, `router ospf 1`, `no network 10.0.12.0 0.0.0.3 area 1`, then `network 10.0.12.0 0.0.0.3 area 0`.'
+      ],
+      explain: 'OSPF neighbours check that their hellos agree on the area, among other things. An area border router (ABR) sits between areas, with each interface in exactly one of them. Once R2’s WAN link joins area 0, R1 learns the branch LAN as an inter-area route, marked `O IA` in its routing table.'
+    },
+    {
+      id: 'p29', day: 6, num: 29, diff: 2, title: 'Out of Time', topics: ['OSPF', 'Hello timers'],
+      teaser: 'Someone tuned the WAN link for faster failover. On one end.',
+      ticket: { id: 'INC-2170', pri: 'P2', opened: '11:40' },
+      story: 'Yesterday someone tuned the WAN link for faster failover, on R2 only, then went on leave. Since then the branch has been cut off from HQ. Both routers still show the link as up/up.',
+      start: 'Branch-PC',
+      devices: {
+        'HQ-Server': host('server', 90, 200, '192.168.1.10', M24, '192.168.1.1'),
+        R1: Object.assign(rt(310, 200, 'HQ', { [G(0)]: { ip: '192.168.1.1', mask: M24 }, [G(1)]: { ip: '10.0.12.1', mask: M30 } }), { ospf: ospf('1.1.1.1', [['192.168.1.0', '0.0.0.255', 0], ['10.0.12.0', '0.0.0.3', 0]], [G(0)]) }),
+        R2: Object.assign(rt(570, 200, 'Branch', { [G(1)]: { ip: '10.0.12.2', mask: M30, hello: 5 }, [G(0)]: { ip: '192.168.2.1', mask: M24 } }), { ospf: ospf('2.2.2.2', [['10.0.12.0', '0.0.0.3', 0], ['192.168.2.0', '0.0.0.255', 0]], [G(0)]) }),
+        'Branch-PC': host('pc', 810, 200, '192.168.2.20', M24, '192.168.2.1')
+      },
+      links: [link('HQ-Server', F0, 'R1', G(0)), link('R1', G(1), 'R2', G(1)), link('R2', G(0), 'Branch-PC', F0)],
+      labels: [{ x: 200, y: 120, t: '192.168.1.0/24' }, { x: 440, y: 120, t: 'OSPF area 0' }, { x: 690, y: 120, t: '192.168.2.0/24' }],
+      objectives: [
+        { from: 'Branch-PC', to: '192.168.1.10', text: 'Branch-PC can reach HQ-Server' },
+        { from: 'HQ-Server', to: '192.168.2.20', text: 'HQ-Server can reach Branch-PC' }
+      ],
+      hints: [
+        'The link is up but `show ip ospf neighbor` is empty on both routers. Compare `show ip ospf interface g0/1` on each.',
+        'R2 sends hellos every 5 seconds with a 20-second dead timer. R1 uses the defaults, 10 and 40. OSPF neighbours must agree on both, so they ignore each other’s hellos.',
+        'On R2: `en`, `conf t`, `int g0/1`, `no ip ospf hello-interval`. (Setting R1 to 5 seconds as well also works.)'
+      ],
+      explain: 'Hello and dead intervals are carried in every OSPF hello, and a router ignores hellos whose timers don’t match its own. Faster timers do speed up failure detection, but only if both ends agree. Changing the hello interval also moves the dead interval to four times the hello, unless you set it yourself.'
+    },
+    {
+      id: 'p30', day: 6, num: 30, diff: 3, title: 'Exactly Zero', topics: ['OSPF', 'Wildcard masks'],
+      teaser: 'The lab router joined OSPF yesterday. Nobody has heard from it since.',
+      ticket: { id: 'INC-2174', pri: 'P2', opened: '10:00' },
+      story: 'The lab router, R3, was added to OSPF yesterday. R1 and R2 are neighbours as always, but R3 never shows up anywhere, and the lab is unreachable. R3’s config “looks right”, says the engineer who wrote it.',
+      start: 'HQ-PC',
+      devices: {
+        'HQ-PC': host('pc', 80, 200, '192.168.1.20', M24, '192.168.1.1'),
+        R1: Object.assign(rt(255, 200, 'HQ', { [G(0)]: { ip: '192.168.1.1', mask: M24 }, [G(1)]: { ip: '10.0.12.1', mask: M30 } }), { ospf: ospf('1.1.1.1', [['192.168.1.0', '0.0.0.255', 0], ['10.0.12.0', '0.0.0.3', 0]], [G(0)]) }),
+        R2: Object.assign(rt(460, 200, 'Core', { [G(1)]: { ip: '10.0.12.2', mask: M30 }, [G(2)]: { ip: '10.0.23.1', mask: M30 } }), { ospf: ospf('2.2.2.2', [['10.0.12.0', '0.0.0.3', 0], ['10.0.23.0', '0.0.0.3', 0]]) }),
+        R3: Object.assign(rt(665, 200, 'Lab', { [G(2)]: { ip: '10.0.23.2', mask: M30 }, [G(0)]: { ip: '172.16.3.1', mask: M24 } }), { ospf: ospf('3.3.3.3', [['10.0.23.0', '0.0.0.0', 0], ['172.16.3.0', '0.0.0.255', 0]], [G(0)]) }),
+        'Lab-PC': host('pc', 845, 200, '172.16.3.20', M24, '172.16.3.1')
+      },
+      links: [link('HQ-PC', F0, 'R1', G(0)), link('R1', G(1), 'R2', G(1)), link('R2', G(2), 'R3', G(2)), link('R3', G(0), 'Lab-PC', F0)],
+      labels: [{ x: 168, y: 120, t: '192.168.1.0/24' }, { x: 358, y: 120, t: '10.0.12.0/30' }, { x: 562, y: 120, t: '10.0.23.0/30' }, { x: 755, y: 120, t: '172.16.3.0/24' }],
+      objectives: [
+        { from: 'HQ-PC', to: '172.16.3.20', text: 'HQ-PC can reach Lab-PC' },
+        { from: 'HQ-PC', to: '10.0.23.1', text: 'HQ-PC can still reach R2' }
+      ],
+      hints: [
+        'On R3, `show ip ospf interface brief` lists the interfaces OSPF is actually running on. Which one is missing?',
+        'R3 has `network 10.0.23.0 0.0.0.0 area 0`. A wildcard of 0.0.0.0 means “match this exact address”, and no interface has the address 10.0.23.0. R3’s link address is 10.0.23.2, so OSPF never starts on the link.',
+        'On R3: `en`, `conf t`, `router ospf 1`, `no network 10.0.23.0 0.0.0.0 area 0`, then `network 10.0.23.0 0.0.0.3 area 0`. (`network 10.0.23.2 0.0.0.0 area 0` works too.)'
+      ],
+      explain: 'OSPF network statements match interface addresses using a wildcard mask, just like ACLs. 10.0.23.0 0.0.0.3 matches the whole /30; 10.0.23.2 0.0.0.0 matches just that interface. 10.0.23.0 0.0.0.0 matches an address no interface can have, so the statement silently does nothing.'
+    },
+
+    // ---------------- Day 7 ----------------
+    {
+      id: 'p31', day: 7, num: 31, diff: 1, title: 'Saved by the Bell', topics: ['Default routes', 'Saving config'],
+      teaser: 'After a power cut, the office lost the internet.',
+      ticket: { id: 'INC-2180', pri: 'P1', opened: '07:20' },
+      story: 'There was a power cut overnight. Everything came back up, but the office has no internet. Last week someone added a line to R1 to fix exactly this kind of problem. It worked at the time.',
+      start: 'Office-PC',
+      devices: edge({ routes: [] }),
+      links: edgeLinks(),
+      labels: edgeLabels(),
+      objectives: [
+        { from: 'Office-PC', to: '198.51.100.10', port: 80, text: 'Office-PC can load the website on Web' },
+        { from: 'Office-PC2', to: '203.0.113.1', text: 'Office-PC2 can still reach the ISP router' }
+      ],
+      hints: [
+        'The office can reach R1 and even the ISP router next door, but nothing beyond. Read R1’s routing table.',
+        '“Gateway of last resort is not set.” R1 has no default route. The one added last week was never saved to the startup config, so the reboot wiped it.',
+        'On R1: `en`, `conf t`, `ip route 0.0.0.0 0.0.0.0 203.0.113.1`, then `end` and `copy running-config startup-config`, so it survives the next power cut.'
+      ],
+      explain: 'Cisco devices run from the running config but boot from the startup config. Any change you don’t save with `copy running-config startup-config` (or `write memory`) disappears at the next reload. The ISP router is directly connected, which is why it still answered; everything else on the internet needs the default route.'
+    },
+    {
+      id: 'p32', day: 7, num: 32, diff: 2, title: 'Inside Out', topics: ['NAT'],
+      teaser: 'R1 can reach the internet. Nobody behind it can.',
+      ticket: { id: 'INC-2183', pri: 'P1', opened: '08:05' },
+      story: 'R1 was rebuilt from scratch last night after a failed upgrade. The whole office has lost the internet. Strangely, R1 itself can ping websites just fine.',
+      start: 'Office-PC',
+      devices: edge({ g0: { natIn: false } }),
+      links: edgeLinks(),
+      labels: edgeLabels(),
+      objectives: [
+        { from: 'Office-PC', to: '198.51.100.10', port: 80, text: 'Office-PC can load the website on Web' },
+        { from: 'Office-PC2', to: '198.51.100.10', text: 'Office-PC2 can ping Web' }
+      ],
+      hints: [
+        'Test from Office-PC, then check R1’s translations with `show ip nat translations`. Nothing is being translated.',
+        'NAT only translates traffic that arrives on an `ip nat inside` interface and leaves on an `ip nat outside` one. Gi0/1 is marked outside, but the office interface, Gi0/0, isn’t marked at all, so the office’s private addresses go out untranslated and the ISP has no way to reply.',
+        'On R1: `en`, `conf t`, `int g0/0`, `ip nat inside`.'
+      ],
+      explain: 'Private addresses like 192.168.x.x can’t be routed on the internet, so the edge router swaps them for its public address (PAT, `overload`). For that, every interface needs a role: inside or outside. R1’s own pings worked because they already come from its public address.'
+    },
+    {
+      id: 'p33', day: 7, num: 33, diff: 2, title: 'Change of Address', topics: ['NAT', 'ACLs'],
+      teaser: 'The office was renumbered. The internet didn’t come with it.',
+      ticket: { id: 'INC-2186', pri: 'P1', opened: '07:45' },
+      story: 'At the weekend the office was renumbered from 192.168.1.0/24 to 192.168.10.0/24 to make room for growth. Everything inside the office works. Nothing reaches the internet.',
+      start: 'Office-PC',
+      devices: edge({ acl: '192.168.1.0' }),
+      links: edgeLinks(),
+      labels: edgeLabels(),
+      objectives: [
+        { from: 'Office-PC', to: '198.51.100.10', port: 80, text: 'Office-PC can load the website on Web' },
+        { from: 'Office-PC', to: '192.168.10.22', text: 'Office-PC can still reach Office-PC2' }
+      ],
+      hints: [
+        'NAT is set up and both interfaces have their roles. Which addresses is it allowed to translate? `show running-config` on R1, then `show access-lists`.',
+        'NAT translates addresses that match ACL 1, which still permits the old subnet, 192.168.1.0/24. The new 192.168.10.0/24 never matches, so it’s never translated.',
+        'On R1: `en`, `conf t`, `access-list 1 permit 192.168.10.0 0.0.0.255`.'
+      ],
+      explain: 'The ACL in `ip nat inside source list 1 ...` doesn’t filter traffic; it decides which source addresses get translated. Anything it doesn’t permit leaves untranslated and can’t get replies. Renumbering means finding every place the old subnet is written down: ACLs, NAT, routes, firewall rules.'
+    },
+    {
+      id: 'p34', day: 7, num: 34, diff: 2, title: 'Port Forward', topics: ['Static NAT'],
+      teaser: 'The shop works inside the office. Customers can’t reach it.',
+      ticket: { id: 'INC-2190', pri: 'P1', opened: '09:00' },
+      story: 'The online shop server was moved to a new address, 192.168.10.50, last night. Staff can reach it inside the office, but customers on the internet can’t reach the shop’s public address, 203.0.113.10.',
+      start: 'Customer',
+      devices: edge({ shop: true }),
+      links: edgeLinks({ shop: true }),
+      labels: edgeLabels(),
+      objectives: [
+        { from: 'Customer', to: '203.0.113.10', port: 80, text: 'Customer can load the shop at 203.0.113.10' },
+        { from: 'Office-PC', to: '192.168.10.50', port: 80, text: 'Office-PC can still load the shop internally' }
+      ],
+      hints: [
+        'Test from Customer, then look at R1’s NAT entries with `show ip nat translations`.',
+        'The static NAT entry still maps the public address 203.0.113.10 to 192.168.10.80, the server’s old address.',
+        'On R1: `en`, `conf t`, `no ip nat inside source static 192.168.10.80 203.0.113.10`, then `ip nat inside source static 192.168.10.50 203.0.113.10`.'
+      ],
+      explain: 'Static NAT permanently maps one public address to one inside address, which is how servers behind NAT are reached from the internet. It points at an address, not a machine, so when a server moves the mapping has to move with it.'
+    },
+    {
+      id: 'p35', day: 7, num: 35, diff: 3, title: 'Default Silence', topics: ['OSPF', 'Default routes', 'NAT'],
+      teaser: 'HQ has the internet. The branch, one OSPF hop away, doesn’t.',
+      ticket: { id: 'INC-2194', pri: 'P2', opened: '10:30' },
+      story: 'The branch was connected to HQ with OSPF last week, and the branch can reach everything at HQ. HQ has internet through R1. The branch doesn’t, even though NAT on R1 was set up for both sites.',
+      start: 'Branch-PC',
+      devices: edgeOspf({}),
+      links: edgeOspfLinks(),
+      labels: edgeOspfLabels(),
+      objectives: [
+        { from: 'Branch-PC', to: '198.51.100.10', port: 80, text: 'Branch-PC can load the website on Web' },
+        { from: 'HQ-PC', to: '198.51.100.10', port: 80, text: 'HQ-PC can still load the website' },
+        { from: 'Branch-PC', to: '192.168.10.21', text: 'Branch-PC can still reach HQ-PC' }
+      ],
+      hints: [
+        'Look at R2’s routing table. Is there a gateway of last resort?',
+        'R1 has a static default route to the ISP, but OSPF doesn’t share static routes unless told to, so R2 never learns any way to the internet.',
+        'On R1: `en`, `conf t`, `router ospf 1`, `default-information originate`.'
+      ],
+      explain: '`default-information originate` makes an OSPF router advertise its default route to everyone else, as an external route (`O*E2` in their routing tables). Only the edge router should do it, and only while it actually has a default route itself.'
+    },
+
+    // ---------------- Day 8 ----------------
+    {
+      id: 'p36', day: 8, num: 36, diff: 1, title: 'Speed Trap', topics: ['Speed and duplex'],
+      teaser: 'The uplink to the router is dead, and both ends say they’re fine.',
+      ticket: { id: 'INC-2200', pri: 'P1', opened: '08:25' },
+      story: 'Yesterday someone “troubleshooting a slow network” hard-coded the speed on both ends of the link between the office switch and the router. Now the office can’t reach anything, not even the router.',
+      start: 'Office-PC',
+      devices: {
+        'Office-PC': host('pc', 100, 110, '192.168.10.21', M24, '192.168.10.1'),
+        'Office-PC2': host('pc', 100, 290, '192.168.10.22', M24, '192.168.10.1'),
+        SW1: sw(320, 200, 'Office', null, { [G(1)]: { speed: '10', description: 'Uplink to R1' } }),
+        R1: rt(560, 200, 'Edge', { [G(0)]: { ip: '192.168.10.1', mask: M24, speed: '100' }, [G(1)]: { ip: '10.3.3.1', mask: M24 } }),
+        'App-Server': host('server', 790, 200, '10.3.3.10', M24, '10.3.3.1')
+      },
+      links: [link('Office-PC', F0, 'SW1', F(1)), link('Office-PC2', F0, 'SW1', F(2)), link('SW1', G(1), 'R1', G(0)), link('R1', G(1), 'App-Server', F0)],
+      labels: [{ x: 320, y: 60, t: '192.168.10.0/24' }, { x: 675, y: 120, t: '10.3.3.0/24' }],
+      objectives: [
+        { from: 'Office-PC', to: '10.3.3.10', text: 'Office-PC can reach App-Server' },
+        { from: 'Office-PC2', to: '192.168.10.1', text: 'Office-PC2 can reach R1' }
+      ],
+      hints: [
+        'The office can’t even reach R1. Check the uplink: `show interfaces status` on SW1 and `show interfaces g0/0` on R1.',
+        'SW1’s uplink is hard-coded to 10 Mb/s and R1’s port to 100 Mb/s. Two different fixed speeds can’t form a link at all.',
+        'On SW1: `en`, `conf t`, `int g0/1`, `speed auto`, `duplex auto`.'
+      ],
+      explain: 'A duplex mismatch half-works; a speed mismatch doesn’t work at all, because the two ends can’t even agree on how to signal. With one end on auto it will sense the other’s speed and follow it. The safest setting is auto on both ends.'
+    },
+    {
+      id: 'p37', day: 8, num: 37, diff: 1, title: 'Seeing Double', topics: ['IP addressing', 'ARP'],
+      teaser: 'Pings to the file server work. The files don’t.',
+      ticket: { id: 'INC-2203', pri: 'P3', opened: '09:45' },
+      story: 'A new printer went in next to the accounts team yesterday. Since then their PCs can’t open the file server’s shares, even though pinging 192.168.10.10 works. Reception, on the other switch, is fine.',
+      start: 'Accounts-PC',
+      devices: {
+        'Accounts-PC': host('pc', 90, 110, '192.168.10.21', M24, '192.168.10.1'),
+        Printer: host('printer', 90, 290, '192.168.10.10', M24, '192.168.10.1', { mac: '3cd9.2b5e.0a17' }),
+        SW1: sw(300, 200, 'Accounts'),
+        SW2: sw(570, 200, 'Reception'),
+        'File-Server': host('server', 800, 110, '192.168.10.10', M24, '192.168.10.1', { mac: '0050.56a1.10fe' }),
+        'Reception-PC': host('pc', 800, 290, '192.168.10.31', M24, '192.168.10.1')
+      },
+      links: [link('Accounts-PC', F0, 'SW1', F(1)), link('Printer', F0, 'SW1', F(2)), link('SW1', G(1), 'SW2', G(1)), link('File-Server', F0, 'SW2', F(1)), link('Reception-PC', F0, 'SW2', F(2))],
+      labels: [{ x: 435, y: 60, t: '192.168.10.0/24' }],
+      objectives: [
+        { from: 'Accounts-PC', to: '192.168.10.10', dev: 'File-Server', text: 'Accounts-PC reaches the real File-Server at .10' },
+        { from: 'Accounts-PC', to: '192.168.10.40', text: 'Accounts-PC can reach the Printer at .40' },
+        { from: 'Reception-PC', to: '192.168.10.10', dev: 'File-Server', text: 'Reception-PC can still reach File-Server' }
+      ],
+      hints: [
+        'Ping 192.168.10.10 from Accounts-PC and read the status line under the map: who actually answered? `arp -a` shows which MAC address replied.',
+        'The new Printer was given the file server’s address, 192.168.10.10. With two devices on one address, whichever answers ARP first gets the traffic, and for the accounts PCs that’s the printer next to them. It was meant to be 192.168.10.40.',
+        'Open the Printer’s IP settings tab and set 192.168.10.40, mask 255.255.255.0, gateway 192.168.10.1.'
+      ],
+      explain: 'A duplicate IP address is a race: ARP asks who has the address, both devices answer, and senders believe whichever reply they use. Ping still “works”, it just reaches the wrong box. `arp -a` showing an unexpected MAC address is the giveaway.'
+    },
+    {
+      id: 'p38', day: 8, num: 38, diff: 2, title: 'Guest Pass', topics: ['ACLs', 'ACL direction'],
+      teaser: 'An auditor on the guest Wi-Fi opened the payroll server.',
+      ticket: { id: 'INC-2207', pri: 'P1', opened: '14:10' },
+      story: 'An auditor sat in reception, joined the guest Wi-Fi, and opened the payroll server. The guest ACL was put in last month and nobody tested it. Guests must keep their internet access, and staff must keep payroll.',
+      start: 'Guest-Laptop',
+      devices: {
+        'Staff-PC': host('pc', 90, 110, '192.168.10.21', M24, '192.168.10.1'),
+        'Guest-Laptop': host('pc', 90, 300, '192.168.50.30', M24, '192.168.50.1'),
+        Upstream: Object.assign(rt(330, 62, 'Internet', { [G(0)]: { ip: '100.64.0.1', mask: M30 } }, [{ net: '192.168.50.0', mask: M24, nh: '100.64.0.2' }]), { locked: true }),
+        R1: Object.assign(rt(330, 220, 'Edge', {
+          [G(0)]: { ip: '192.168.10.1', mask: M24, description: 'Staff' },
+          [G(1)]: { ip: '10.10.10.1', mask: M24, description: 'Servers' },
+          [G(2)]: { ip: '192.168.50.1', mask: M24, description: 'Guest Wi-Fi', aclOut: 'GUEST' },
+          [G(3)]: { ip: '100.64.0.2', mask: M30, description: 'Internet' }
+        }, [{ net: '0.0.0.0', mask: '0.0.0.0', nh: '100.64.0.1' }]), { acls: { GUEST: { type: 'ext', entries: [
+          { seq: 10, action: 'deny', proto: 'ip', src: net('192.168.50.0', '0.0.0.255'), dst: net('10.10.10.0', '0.0.0.255'), dport: null },
+          { seq: 20, action: 'permit', proto: 'ip', src: ANY, dst: ANY, dport: null }
+        ] } } }),
+        SW1: sw(560, 220, 'Server room'),
+        Payroll: host('server', 790, 120, '10.10.10.20', M24, '10.10.10.1', { services: [80], site: 'Payroll' }),
+        Wiki: host('server', 790, 300, '10.10.10.30', M24, '10.10.10.1', { services: [80], site: 'Wiki' })
+      },
+      links: [link('Staff-PC', F0, 'R1', G(0)), link('Guest-Laptop', F0, 'R1', G(2)), link('R1', G(3), 'Upstream', G(0)), link('R1', G(1), 'SW1', G(1)), link('Payroll', F0, 'SW1', F(1)), link('Wiki', F0, 'SW1', F(2))],
+      labels: [{ x: 665, y: 52, t: '10.10.10.0/24' }],
+      objectives: [
+        { from: 'Guest-Laptop', to: '10.10.10.20', blocked: true, text: 'Guest-Laptop can’t reach Payroll' },
+        { from: 'Guest-Laptop', to: '100.64.0.1', text: 'Guest-Laptop can still reach the internet' },
+        { from: 'Staff-PC', to: '10.10.10.20', text: 'Staff-PC can still reach Payroll' }
+      ],
+      hints: [
+        'The GUEST ACL exists and looks right. Check where it’s applied, and in which direction: `show ip interface g0/2`.',
+        'GUEST is applied outbound on the guest interface, so it only checks traffic going to the guests. Guest traffic toward payroll comes in on Gi0/2 and never meets it. Its deny line matches guest source addresses, which only makes sense inbound.',
+        'On R1: `en`, `conf t`, `int g0/2`, `no ip access-group GUEST out`, then `ip access-group GUEST in`.'
+      ],
+      explain: '“In” and “out” are from the router’s point of view: in means traffic arriving on that interface, out means traffic leaving through it. An ACL written about guest source addresses has to see traffic coming from the guests, so it goes inbound on the guest interface. Always test an ACL from the side it’s meant to stop.'
+    },
+    {
+      id: 'p39', day: 8, num: 39, diff: 2, title: 'Backup Plan', topics: ['Floating static routes'],
+      teaser: 'The fibre is cut. The 4G backup never kicked in.',
+      ticket: { id: 'INC-2211', pri: 'P1', opened: '11:05' },
+      story: 'Roadworks cut the branch’s fibre to HQ this morning; the carrier is on it. The branch has a 4G backup link for exactly this, with a backup route that should take over automatically. It didn’t, and the branch is offline.',
+      start: 'Branch-PC',
+      devices: {
+        'Branch-PC': host('pc', 80, 200, '192.168.5.20', M24, '192.168.5.1'),
+        R1: rt(270, 200, 'Branch', {
+          [G(0)]: { ip: '192.168.5.1', mask: M24 },
+          [G(1)]: { ip: '10.0.12.1', mask: M30, description: 'Fibre to HQ' },
+          [G(2)]: { ip: '10.0.13.1', mask: '255.255.255.248', description: '4G backup' }
+        }, [{ net: '10.10.0.0', mask: '255.255.0.0', nh: '10.0.12.2' }, { net: '10.10.0.0', mask: '255.255.0.0', nh: '10.0.13.30', ad: 250 }]),
+        R2: rt(600, 115, 'HQ', {
+          [G(1)]: { ip: '10.0.12.2', mask: M30 }, [G(2)]: { ip: '10.0.23.2', mask: M30 }, [G(0)]: { ip: '10.10.1.1', mask: '255.255.0.0' }
+        }, [{ net: '192.168.5.0', mask: M24, nh: '10.0.12.1' }, { net: '192.168.5.0', mask: M24, nh: '10.0.23.3', ad: 250 }]),
+        R3: rt(440, 290, '4G router', { [G(2)]: { ip: '10.0.13.3', mask: '255.255.255.248' }, [G(1)]: { ip: '10.0.23.3', mask: M30 } },
+          [{ net: '10.10.0.0', mask: '255.255.0.0', nh: '10.0.23.2' }, { net: '192.168.5.0', mask: M24, nh: '10.0.13.1' }]),
+        'HQ-Server': host('server', 820, 115, '10.10.1.50', '255.255.0.0', '10.10.1.1')
+      },
+      links: [link('Branch-PC', F0, 'R1', G(0)), Object.assign(link('R1', G(1), 'R2', G(1)), { cut: true }), link('R1', G(2), 'R3', G(2)), link('R3', G(1), 'R2', G(2)), link('R2', G(0), 'HQ-Server', F0)],
+      labels: [{ x: 440, y: 60, t: 'Fibre (cut)' }, { x: 720, y: 290, t: 'HQ 10.10.0.0/16' }],
+      objectives: [
+        { from: 'Branch-PC', to: '10.10.1.50', text: 'Branch-PC can reach HQ-Server over the backup' },
+        { from: 'Branch-PC', to: '10.0.13.3', text: 'Branch-PC can still reach the 4G router' }
+      ],
+      hints: [
+        'The fibre is down, so the branch should be using the 4G link. Look at R1’s routing table: is there any route to 10.10.0.0/16 at all? Then `show running-config`.',
+        'The backup is a floating static route: distance 250, so it stays hidden until the fibre route disappears. Its next hop, 10.0.13.30, isn’t in the 4G link’s subnet (10.0.13.0/29 runs .0 to .7), so it can never be installed. The 4G router is 10.0.13.3.',
+        'On R1: `en`, `conf t`, `no ip route 10.10.0.0 255.255.0.0 10.0.13.30 250`, then `ip route 10.10.0.0 255.255.0.0 10.0.13.3 250`.'
+      ],
+      explain: 'A floating static route has a higher administrative distance than the primary, so it only appears when the primary route is gone. That means it never gets tested until the day you need it. HQ’s return route has its own floating backup, which is why fixing the branch side is enough.'
+    },
+    {
+      id: 'p40', day: 8, num: 40, diff: 3, title: 'Static Cling', topics: ['Administrative distance', 'OSPF'],
+      teaser: 'OSPF knows the way to the branch. R1 isn’t listening.',
+      ticket: { id: 'INC-2216', pri: 'P2', opened: '09:15' },
+      story: 'The branch moved from the old MPLS service to a new link running OSPF yesterday. R1 and R2 became neighbours straight away. HQ still can’t reach the branch. The old MPLS router stays plugged in until the carrier collects it.',
+      start: 'HQ-PC',
+      devices: {
+        'HQ-PC': host('pc', 80, 200, '192.168.1.20', M24, '192.168.1.1'),
+        'Old-MPLS': Object.assign(rt(290, 62, 'Carrier', { [G(0)]: { ip: '10.0.99.2', mask: M30 } }), { locked: true }),
+        R1: Object.assign(rt(290, 200, 'HQ', {
+          [G(0)]: { ip: '192.168.1.1', mask: M24 },
+          [G(1)]: { ip: '10.0.12.1', mask: M30, description: 'New link to branch' },
+          [G(2)]: { ip: '10.0.99.1', mask: M30, description: 'MPLS (being removed)' }
+        }, [{ net: '192.168.2.0', mask: M24, nh: '10.0.99.2' }]), { ospf: ospf('1.1.1.1', [['192.168.1.0', '0.0.0.255', 0], ['10.0.12.0', '0.0.0.3', 0]], [G(0)]) }),
+        R2: Object.assign(rt(570, 200, 'Branch', { [G(1)]: { ip: '10.0.12.2', mask: M30 }, [G(0)]: { ip: '192.168.2.1', mask: M24 } }), { ospf: ospf('2.2.2.2', [['10.0.12.0', '0.0.0.3', 0], ['192.168.2.0', '0.0.0.255', 0]], [G(0)]) }),
+        'Branch-PC': host('pc', 810, 200, '192.168.2.20', M24, '192.168.2.1')
+      },
+      links: [link('HQ-PC', F0, 'R1', G(0)), link('R1', G(2), 'Old-MPLS', G(0)), link('R1', G(1), 'R2', G(1)), link('R2', G(0), 'Branch-PC', F0)],
+      labels: [{ x: 430, y: 120, t: 'OSPF area 0' }, { x: 690, y: 120, t: '192.168.2.0/24' }],
+      objectives: [
+        { from: 'HQ-PC', to: '192.168.2.20', text: 'HQ-PC can reach Branch-PC' },
+        { from: 'HQ-PC', to: '10.0.12.2', text: 'HQ-PC can still reach R2' }
+      ],
+      hints: [
+        'R1 and R2 are neighbours and R2 advertises the branch LAN. So which route to 192.168.2.0/24 did R1 actually install? Read `show ip route` closely.',
+        'A static route from the MPLS days is still there. Static routes have an administrative distance of 1 and OSPF has 110, so the static route wins and sends branch traffic to the old MPLS router, which no longer knows the way.',
+        'On R1: `en`, `conf t`, `no ip route 192.168.2.0 255.255.255.0 10.0.99.2`.'
+      ],
+      explain: 'When two sources offer the same prefix, the router installs the one with the lowest administrative distance: connected 0, static 1, OSPF 110. The OSPF route was there all along, hidden behind the static one. Remove the static route and OSPF’s route takes its place instantly.'
+    },
+
+    // ---------------- Day 9 ----------------
+    {
+      id: 'p41', day: 9, num: 41, diff: 1, title: 'Fat Fingers', topics: ['IP addressing'],
+      teaser: 'Reception can’t open the booking system. Everyone else can.',
+      ticket: { id: 'INC-2220', pri: 'P2', opened: '08:00' },
+      story: 'The reception PC was reimaged last night and its static address typed back in by hand. This morning reception can’t open the booking system. The office PC on the same switch is fine.',
+      start: 'Reception-PC',
+      devices: {
+        'Reception-PC': host('pc', 100, 110, '192.168.100.21', M24, '192.168.10.1'),
+        'Office-PC': host('pc', 100, 290, '192.168.10.22', M24, '192.168.10.1'),
+        SW1: sw(320, 200, 'Office'),
+        R1: rt(560, 200, 'Edge', { [G(0)]: { ip: '192.168.10.1', mask: M24 }, [G(1)]: { ip: '10.4.4.1', mask: M24 } }),
+        'Booking-Server': host('server', 790, 200, '10.4.4.40', M24, '10.4.4.1', { services: [80], site: 'Bookings' })
+      },
+      links: [link('Reception-PC', F0, 'SW1', F(1)), link('Office-PC', F0, 'SW1', F(2)), link('SW1', G(1), 'R1', G(0)), link('R1', G(1), 'Booking-Server', F0)],
+      labels: [{ x: 320, y: 60, t: '192.168.10.0/24' }, { x: 675, y: 120, t: '10.4.4.0/24' }],
+      objectives: [
+        { from: 'Reception-PC', to: '10.4.4.40', port: 80, text: 'Reception-PC can open the booking website' },
+        { from: 'Office-PC', to: '10.4.4.40', port: 80, text: 'Office-PC can still open the booking website' }
+      ],
+      hints: [
+        'Compare `ipconfig` on Reception-PC and Office-PC, digit by digit.',
+        'Reception-PC is 192.168.100.21 instead of 192.168.10.21. Its requests still reach the server through the gateway, but replies to 192.168.100.21 have nowhere to go: no router knows that subnet.',
+        'Open Reception-PC’s IP settings tab and set 192.168.10.21, mask 255.255.255.0, gateway 192.168.10.1.'
+      ],
+      explain: 'One extra digit puts a PC in a different subnet. Here the request still got out, because the gateway happened to answer, but replies are routed to the address the PC claimed, and no router had a route to 192.168.100.0/24. Asymmetric failures like this are why you test both directions.'
+    },
+    {
+      id: 'p42', day: 9, num: 42, diff: 2, title: 'Third Floor', topics: ['Inter-VLAN routing', 'Trunks'],
+      teaser: 'Level 3 can print. Level 3 can’t reach anyone else.',
+      ticket: { id: 'INC-2224', pri: 'P2', opened: '09:20' },
+      story: 'Level 3 opened this week. Facilities patched the new desks into VLAN 30 on SW1, and the Level 3 team can print to their own printer, but they can’t reach anyone on the other floors.',
+      start: 'L3-PC',
+      devices: {
+        R1: rt(450, 52, 'Router on a stick', {
+          [G(0)]: {},
+          'GigabitEthernet0/0.10': { encap: 10, ip: '192.168.10.1', mask: M24 },
+          'GigabitEthernet0/0.20': { encap: 20, ip: '192.168.20.1', mask: M24 }
+        }),
+        SW1: sw(450, 200, 'Floors', { 1: 'default', 10: 'STAFF', 20: 'SALES', 30: 'LEVEL3' }, {
+          [F(1)]: { vlan: 10 }, [F(2)]: { vlan: 20 }, [F(3)]: { vlan: 30 }, [F(4)]: { vlan: 30 }, [G(1)]: { mode: 'trunk', allowed: [10, 20] }
+        }),
+        'Staff-PC': host('pc', 140, 305, '192.168.10.21', M24, '192.168.10.1'),
+        'Sales-PC': host('pc', 345, 305, '192.168.20.21', M24, '192.168.20.1'),
+        'L3-PC': host('pc', 560, 305, '192.168.30.21', M24, '192.168.30.1'),
+        'L3-Printer': host('printer', 765, 305, '192.168.30.40', M24, '192.168.30.1')
+      },
+      links: [link('R1', G(0), 'SW1', G(1)), link('Staff-PC', F0, 'SW1', F(1)), link('Sales-PC', F0, 'SW1', F(2)), link('L3-PC', F0, 'SW1', F(3)), link('L3-Printer', F0, 'SW1', F(4))],
+      labels: [{ x: 160, y: 120, t: 'VLANs 10, 20, 30' }, { x: 745, y: 120, t: 'L3: 192.168.30.0/24' }],
+      objectives: [
+        { from: 'L3-PC', to: '192.168.10.21', text: 'L3-PC can reach Staff-PC' },
+        { from: 'L3-PC', to: '192.168.30.40', text: 'L3-PC can still reach L3-Printer' },
+        { from: 'Sales-PC', to: '192.168.10.21', text: 'Sales-PC can still reach Staff-PC' }
+      ],
+      hints: [
+        'Level 3 can reach its own printer but not its gateway, 192.168.30.1. Who should own that address? Check R1’s interfaces with `show ip interface brief`, and the trunk to R1 with `show interfaces trunk` on SW1.',
+        'Two things are missing. R1 has no subinterface for VLAN 30, and the trunk to R1 only allows VLANs 10 and 20.',
+        'On SW1: `en`, `conf t`, `int g0/1`, `switchport trunk allowed vlan add 30`. On R1: `en`, `conf t`, `interface g0/0.30`, `encapsulation dot1Q 30`, `ip address 192.168.30.1 255.255.255.0`.'
+      ],
+      explain: 'A new VLAN on a router-on-a-stick needs three things: the VLAN on the access ports, the VLAN allowed on the trunk to the router, and a subinterface on the router tagged for it with the gateway address. Facilities did the first. Fixing one of the other two still leaves Level 3 cut off, which is why it pays to test after each change.'
+    },
+    {
+      id: 'p43', day: 9, num: 43, diff: 2, title: 'Helper Hops', topics: ['DHCP relay', 'Static routes'],
+      teaser: 'The relay is configured. Laptops still get 169.254 addresses.',
+      ticket: { id: 'INC-2229', pri: 'P2', opened: '10:10' },
+      story: 'The new remote site went live yesterday. R2 relays DHCP to the server at HQ, and the server has a scope for the site. Laptops still come up with 169.254 addresses, and the site’s printer, which has a fixed address, can’t reach HQ either.',
+      start: 'Remote-Laptop',
+      devices: {
+        'DC-Server': host('server', 90, 200, '10.1.1.5', M24, '10.1.1.1', { dhcpd: { pools: { REMOTE: { network: '192.168.70.0', mask: M24, router: '192.168.70.1', dns: '10.1.1.5' } }, excluded: [['192.168.70.1', '192.168.70.50']], bindings: {} } }),
+        R1: rt(300, 200, 'HQ', { [G(0)]: { ip: '10.1.1.1', mask: M24 }, [G(1)]: { ip: '10.0.12.1', mask: M30, description: 'To remote site' } }),
+        R2: rt(530, 200, 'Remote', { [G(1)]: { ip: '10.0.12.2', mask: M30 }, [G(0)]: { ip: '192.168.70.1', mask: M24, helper: ['10.1.1.5'] } }, [{ net: '0.0.0.0', mask: '0.0.0.0', nh: '10.0.12.1' }]),
+        SW1: sw(690, 200, 'Remote'),
+        'Remote-Laptop': apipa('pc', 830, 110, '169.254.140.9', { mac: 'f875.a4c0.7001' }),
+        'Remote-Printer': host('printer', 830, 290, '192.168.70.40', M24, '192.168.70.1')
+      },
+      links: [link('DC-Server', F0, 'R1', G(0)), link('R1', G(1), 'R2', G(1)), link('R2', G(0), 'SW1', G(1)), link('Remote-Laptop', F0, 'SW1', F(1)), link('Remote-Printer', F0, 'SW1', F(2))],
+      labels: [{ x: 195, y: 120, t: '10.1.1.0/24' }, { x: 415, y: 120, t: '10.0.12.0/30' }, { x: 690, y: 52, t: '192.168.70.0/24' }],
+      objectives: [
+        { from: 'Remote-Laptop', dhcp: true, text: 'Remote-Laptop gets an address from DHCP' },
+        { from: 'Remote-Laptop', to: '10.1.1.5', text: 'Remote-Laptop can reach DC-Server' },
+        { from: 'Remote-Printer', to: '10.1.1.5', text: 'Remote-Printer can reach DC-Server' }
+      ],
+      hints: [
+        'R2 is relaying to 10.1.1.5, so the request does reach the server. Can the server’s reply get back? Try `ping 192.168.70.1` from DC-Server, or `tracert` from Remote-Printer.',
+        'The server sends its offer to the relay’s address, 192.168.70.1, and R1 has no route to 192.168.70.0/24. The printer’s replies die the same way.',
+        'On R1: `en`, `conf t`, `ip route 192.168.70.0 255.255.255.0 10.0.12.2`. Then on Remote-Laptop: `ipconfig /renew`.'
+      ],
+      explain: 'A DHCP relay is a round trip: the relay forwards the request to the server, and the server sends its offer back to the relay’s own address on the client subnet. That address has to be routable from the server’s side. R2 had a default route toward HQ, so requests got out; nothing knew the way back.'
+    },
+    {
+      id: 'p44', day: 9, num: 44, diff: 3, title: 'Double Trouble', topics: ['Trunks', 'Native VLAN', 'Allowed VLANs'],
+      teaser: 'Two engineers each fixed the trunk. Now two things are broken.',
+      ticket: { id: 'INC-2233', pri: 'P1', opened: '07:40' },
+      story: 'Two engineers each “fixed” the trunk between Level 3 and Level 4 last night, one on each switch, without telling the other. Now staff can’t reach the other floor, and the cameras on Level 3 stopped recording to the NVR on Level 4.',
+      start: 'Staff-PC1',
+      devices: {
+        SW1: sw(250, 100, 'Level 3', { 1: 'default', 10: 'STAFF', 20: 'CAMERAS' }, { [F(1)]: { vlan: 10 }, [F(2)]: { vlan: 20 }, [G(1)]: { mode: 'trunk', native: 10 } }),
+        SW2: sw(650, 100, 'Level 4', { 1: 'default', 10: 'STAFF', 20: 'CAMERAS' }, { [F(1)]: { vlan: 10 }, [F(2)]: { vlan: 20 }, [G(1)]: { mode: 'trunk', allowed: [1, 10] } }),
+        'Staff-PC1': host('pc', 120, 285, '192.168.10.11', M24, '192.168.10.1'),
+        'Camera-L3': host('camera', 380, 285, '192.168.20.31', M24, '192.168.20.1'),
+        'Staff-PC2': host('pc', 520, 285, '192.168.10.12', M24, '192.168.10.1'),
+        NVR: host('server', 780, 285, '192.168.20.50', M24, '192.168.20.1')
+      },
+      links: [link('SW1', G(1), 'SW2', G(1)), link('Staff-PC1', F0, 'SW1', F(1)), link('Camera-L3', F0, 'SW1', F(2)), link('Staff-PC2', F0, 'SW2', F(1)), link('NVR', F0, 'SW2', F(2))],
+      labels: [{ x: 450, y: 372, t: 'STAFF VLAN 10: 192.168.10.0/24 · CAMERAS VLAN 20: 192.168.20.0/24' }],
+      objectives: [
+        { from: 'Staff-PC1', to: '192.168.10.12', text: 'Staff-PC1 (Level 3) can reach Staff-PC2 (Level 4)' },
+        { from: 'NVR', to: '192.168.20.31', text: 'NVR can reach Camera-L3' }
+      ],
+      hints: [
+        'There are two faults, one per switch. Start with SW1’s console log, then compare `show interfaces trunk` on both switches.',
+        'SW1’s native VLAN is 10, so it sends staff traffic untagged and SW2 files it into VLAN 1. Separately, SW2 only allows VLANs 1 and 10 on the trunk, so camera traffic in VLAN 20 is dropped.',
+        'On SW1: `en`, `conf t`, `int g0/1`, `switchport trunk native vlan 1`. On SW2: `en`, `conf t`, `int g0/1`, `switchport trunk allowed vlan add 20`.'
+      ],
+      explain: 'Two faults with two symptoms is a good reason to fix one, retest, and look again. Both ends of a trunk must agree on the native VLAN, and both must allow every VLAN that needs to cross. `show interfaces trunk` on both ends, side by side, shows both problems at once.'
+    },
+    {
+      id: 'p45', day: 9, num: 45, diff: 3, title: 'Friday the 13th', topics: ['OSPF', 'Default routes', 'NAT'],
+      teaser: 'A new branch router: no HQ, no internet, and no neighbours.',
+      ticket: { id: 'INC-2238', pri: 'P1', opened: '08:13' },
+      story: 'A new branch router went in yesterday, built from the standard template, and the branch was meant to get everything through HQ, internet included. The branch has nothing: no HQ, no internet. It’s Friday the 13th, so expect more than one problem.',
+      start: 'Branch-PC',
+      devices: edgeOspf({ passiveWan: true }),
+      links: edgeOspfLinks(),
+      labels: edgeOspfLabels(),
+      objectives: [
+        { from: 'Branch-PC', to: '192.168.10.21', text: 'Branch-PC can reach HQ-PC' },
+        { from: 'Branch-PC', to: '198.51.100.10', port: 80, text: 'Branch-PC can load the website on Web' },
+        { from: 'HQ-PC', to: '198.51.100.10', port: 80, text: 'HQ-PC can still load the website' }
+      ],
+      hints: [
+        'Start with `show ip ospf neighbor` on R1 and R2. Fix what you find, test again, then read R2’s routing table.',
+        'First: R2’s WAN interface, Gi0/1, is passive, so there’s no OSPF neighbour. Second: even once they’re neighbours, R1 doesn’t advertise its default route, so the branch has no way to the internet.',
+        'On R2: `en`, `conf t`, `router ospf 1`, `no passive-interface g0/1`. On R1: `en`, `conf t`, `router ospf 1`, `default-information originate`.'
+      ],
+      explain: 'Layered faults hide behind each other: until the neighbour came up, the missing default route was invisible. Fix, retest, re-read. Once R1 originates its default route, R2 learns `O*E2 0.0.0.0/0`, and R1’s NAT, which already covered the branch subnet, does the rest.'
     }
+
   ];
 
   if (typeof module !== 'undefined' && module.exports) { module.exports = PUZZLES; module.exports.DAYS = DAYS; }

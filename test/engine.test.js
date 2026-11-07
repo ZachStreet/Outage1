@@ -39,7 +39,32 @@ const FIXES = {
   p17: s => s.run('R1', 'en', 'conf t', 'access-list 10 permit 192.168.20.0 0.0.0.255'),
   p18: s => s.run('R1', 'en', 'conf t', 'access-list 110 permit tcp any host 10.20.0.10 eq www'),
   p19: s => s.run('R1', 'en', 'conf t', 'ip access-list extended GUEST-IN', 'no 20', '5 permit ip 192.168.50.0 0.0.0.255 host 10.30.0.40'),
-  p20: s => s.run('R1', 'en', 'conf t', 'no access-list 15', 'access-list 15 permit 192.168.99.0 0.0.0.255')
+  p20: s => s.run('R1', 'en', 'conf t', 'no access-list 15', 'access-list 15 permit 192.168.99.0 0.0.0.255'),
+  p21: s => { s.run('R1', 'en', 'conf t', 'no ip dhcp excluded-address 192.168.10.1 192.168.10.254', 'ip dhcp excluded-address 192.168.10.1 192.168.10.20'); s.run('New-Laptop', 'ipconfig /renew'); },
+  p22: s => s.run('CORE', 'en', 'conf t', 'interface vlan 20', 'no shutdown'),
+  p23: s => { s.run('R1', 'en', 'conf t', 'int g0/1', 'ip helper-address 10.1.1.5'); s.run('Laptop', 'ipconfig /renew'); },
+  p24: s => { s.run('R1', 'en', 'conf t', 'ip dhcp pool LAB', 'default-router 192.168.30.1'); s.run('Lab-Laptop', 'ipconfig /renew'); },
+  p25: s => s.run('CORE', 'en', 'conf t', 'interface vlan 30', 'no ip address', 'interface vlan 40', 'ip address 192.168.30.1 255.255.255.0', 'no shutdown'),
+  p26: s => s.run('R2', 'en', 'conf t', 'router ospf 1', 'network 192.168.2.0 0.0.0.255 area 0'),
+  p27: s => s.run('R2', 'en', 'conf t', 'router ospf 1', 'no passive-interface g0/1'),
+  p28: s => s.run('R2', 'en', 'conf t', 'router ospf 1', 'no network 10.0.12.0 0.0.0.3 area 1', 'network 10.0.12.0 0.0.0.3 area 0'),
+  p29: s => s.run('R2', 'en', 'conf t', 'int g0/1', 'no ip ospf hello-interval'),
+  p30: s => s.run('R3', 'en', 'conf t', 'router ospf 1', 'no network 10.0.23.0 0.0.0.0 area 0', 'network 10.0.23.0 0.0.0.3 area 0'),
+  p31: s => s.run('R1', 'en', 'conf t', 'ip route 0.0.0.0 0.0.0.0 203.0.113.1', 'end', 'copy running-config startup-config'),
+  p32: s => s.run('R1', 'en', 'conf t', 'int g0/0', 'ip nat inside'),
+  p33: s => s.run('R1', 'en', 'conf t', 'access-list 1 permit 192.168.10.0 0.0.0.255'),
+  p34: s => s.run('R1', 'en', 'conf t', 'no ip nat inside source static 192.168.10.80 203.0.113.10', 'ip nat inside source static 192.168.10.50 203.0.113.10'),
+  p35: s => s.run('R1', 'en', 'conf t', 'router ospf 1', 'default-information originate'),
+  p36: s => s.run('SW1', 'en', 'conf t', 'int g0/1', 'speed auto', 'duplex auto'),
+  p37: s => { Object.assign(s.net.devices.Printer, { ip: '192.168.10.40', mask: '255.255.255.0', gw: '192.168.10.1' }); s.net.touch(); },
+  p38: s => s.run('R1', 'en', 'conf t', 'int g0/2', 'no ip access-group GUEST out', 'ip access-group GUEST in'),
+  p39: s => s.run('R1', 'en', 'conf t', 'no ip route 10.10.0.0 255.255.0.0 10.0.13.30 250', 'ip route 10.10.0.0 255.255.0.0 10.0.13.3 250'),
+  p40: s => s.run('R1', 'en', 'conf t', 'no ip route 192.168.2.0 255.255.255.0 10.0.99.2'),
+  p41: s => { Object.assign(s.net.devices['Reception-PC'], { ip: '192.168.10.21' }); s.net.touch(); },
+  p42: s => { s.run('SW1', 'en', 'conf t', 'int g0/1', 'switchport trunk allowed vlan add 30'); s.run('R1', 'en', 'conf t', 'interface g0/0.30', 'encapsulation dot1Q 30', 'ip address 192.168.30.1 255.255.255.0'); },
+  p43: s => { s.run('R1', 'en', 'conf t', 'ip route 192.168.70.0 255.255.255.0 10.0.12.2'); s.run('Remote-Laptop', 'ipconfig /renew'); },
+  p44: s => { s.run('SW1', 'en', 'conf t', 'int g0/1', 'switchport trunk native vlan 1'); s.run('SW2', 'en', 'conf t', 'int g0/1', 'switchport trunk allowed vlan add 20'); },
+  p45: s => { s.run('R2', 'en', 'conf t', 'router ospf 1', 'no passive-interface g0/1'); s.run('R1', 'en', 'conf t', 'router ospf 1', 'default-information originate'); }
 };
 const P = id => PUZ.find(p => p.id === id);
 PUZ.forEach(p => {
@@ -294,6 +319,161 @@ t('p20 "no access-list 15 permit ..." deletes the whole list, which then permits
   const s = setup(P('p20')); s.run('R1', 'en', 'conf t', 'no access-list 15 permit 0.0.0.0 255.255.255.0');
   assert.strictEqual(text(s.sh.R1.exec('do show access-lists')), '');
   assert.deepStrictEqual(objOk(s.net, P('p20')), [true, true, false]);
+});
+
+// ---------- Days 5-9 ----------
+t('p21 excluded pool: APIPA, clear error, pool stats, then .22 after fix', () => {
+  const s = setup(P('p21')); const r = s.run('New-Laptop', 'ipconfig /renew')[0];
+  assert.ok(/unable to contact your DHCP server/.test(text(r)) && /Autoconfiguration IPv4 Address..: 169\.254\./.test(text(r)), text(r));
+  s.run('R1', 'en'); const pool = text(s.sh.R1.exec('show ip dhcp pool'));
+  assert.ok(/Total addresses                : 254/.test(pool) && /Excluded addresses             : 254/.test(pool), pool);
+  FIXES.p21(s); assert.strictEqual(s.net.devices['New-Laptop'].ip, '192.168.10.22');
+  assert.ok(/192\.168\.10\.22\s+013c\.22fb\.100a\.01/.test(text(s.sh.R1.exec('do show ip dhcp binding'))));
+  assert.ok(/DHCP Enabled....................: Yes[\s\S]*DHCP Server.....................: 192\.168\.10\.1/.test(text(s.sh['New-Laptop'].exec('ipconfig /all'))));
+});
+t('p21 static PCs refuse ipconfig /renew', () => { const s = setup(P('p20')); assert.ok(/no adapter is in the state permissible/.test(text(s.sh['IT-PC'].exec('ipconfig /renew')))); });
+t('p22 SVI shut: same VLAN works, routed traffic does not; show ip int brief lists SVIs', () => {
+  const s = setup(P('p22')); s.run('CORE', 'en');
+  assert.ok(/Vlan20\s+192\.168\.20\.1\s+YES manual administratively down\s+down/.test(text(s.sh.CORE.exec('show ip interface brief'))));
+  assert.strictEqual(s.net.ping('Sales-PC', '192.168.10.50').kind, 'arp');
+  const r = s.run('CORE', 'conf t', 'interface vlan 20', 'no shutdown');
+  assert.strictEqual(s.sh.CORE.prompt(), 'CORE(config-if)#');
+  assert.ok(/Interface Vlan20, changed state to up/.test(text(r[2])), text(r[2]));
+  assert.ok(/C\s+192\.168\.20\.0\/24 is directly connected, Vlan20/.test(text(s.sh.CORE.exec('do show ip route'))));
+});
+t('p22 switchport commands are not offered on an SVI', () => {
+  const s = setup(P('p22')); s.run('CORE', 'en', 'conf t', 'int vlan 10');
+  assert.ok(/Invalid input/.test(text(s.sh.CORE.exec('switchport mode trunk'))));
+  assert.ok(!/Invalid/.test(text(s.sh.CORE.exec('ip address 192.168.10.1 255.255.255.0'))));
+});
+t('p22 no ip routing: each VLAN reaches only its own gateway', () => {
+  const s = setup(P('p22')); FIXES.p22(s); s.run('CORE', 'end', 'conf t', 'no ip routing');
+  assert.ok(s.net.ping('Sales-PC', '192.168.20.1').ok); assert.ok(!s.net.ping('Sales-PC', '192.168.10.50').ok);
+  assert.ok(/Default gateway is not set/.test(text(s.sh.CORE.exec('do show ip route'))));
+});
+t('p23 relay: no helper means APIPA; helper relays to the server scope', () => {
+  const s = setup(P('p23')); assert.ok(!s.net.dhcp('Laptop', false).ok);
+  FIXES.p23(s); const d = s.net.devices.Laptop;
+  assert.deepStrictEqual([d.ip, d.gw, d.apipa], ['192.168.50.21', '192.168.50.1', false]);
+  assert.ok(/DHCP Server.....................: 10\.1\.1\.5/.test(text(s.sh.Laptop.exec('ipconfig /all'))));
+  assert.ok(/ip helper-address 10\.1\.1\.5/.test(text(s.sh.R1.exec('do show run'))));
+});
+t('p24 wrong default-router: same subnet fine; pool fix needs a renew', () => {
+  const s = setup(P('p24'));
+  s.run('R1', 'en', 'conf t', 'ip dhcp pool LAB', 'default-router 192.168.30.1');
+  assert.strictEqual(s.sh.R1.prompt(), 'R1(dhcp-config)#');
+  assert.ok(!objOk(s.net, P('p24'))[0], 'still broken until the laptop renews');
+  s.run('Lab-Laptop', 'ipconfig /renew'); assert.strictEqual(s.net.devices['Lab-Laptop'].ip, '192.168.30.21', 'same address, from its binding');
+  assert.ok(objOk(s.net, P('p24')).every(Boolean));
+});
+t('p25 autostate: SVI for a deleted VLAN is down/down; overlap until the old IP is removed', () => {
+  const s = setup(P('p25')); s.run('CORE', 'en');
+  assert.ok(/Vlan30\s+192\.168\.30\.1\s+YES manual down\s+down/.test(text(s.sh.CORE.exec('show ip interface brief'))));
+  const r = s.run('CORE', 'conf t', 'interface vlan 40', 'ip address 192.168.30.1 255.255.255.0');
+  assert.ok(/administratively down/.test(text(r[1])) && /overlaps with Vlan30/.test(text(r[2])), text(r[1]) + text(r[2]));
+});
+t('p26 OSPF: neighbours up, branch LAN missing; show ip protocols; adjacency log', () => {
+  const s = setup(P('p26')); s.run('R1', 'en');
+  assert.ok(/^2\.2\.2\.2\s+1\s+FULL\/DR\s+00:00:3\d\s+10\.0\.12\.2\s+GigabitEthernet0\/1$/m.test(text(s.sh.R1.exec('show ip ospf neighbor'))));
+  assert.ok(!/192\.168\.2\.0/.test(text(s.sh.R1.exec('show ip route'))));
+  s.run('R2', 'en'); assert.ok(/Routing for Networks:\n    10\.0\.12\.0 0\.0\.0\.3 area 0\n  Passive/.test(text(s.sh.R2.exec('show ip protocols'))));
+  FIXES.p26(s); assert.ok(/O\s+192\.168\.2\.0\/24 \[110\/2\] via 10\.0\.12\.2, .*GigabitEthernet0\/1/.test(text(s.sh.R1.exec('show ip route'))));
+});
+t('p27 passive transit link: no neighbours; un-passive logs the adjacency on both ends', () => {
+  const s = setup(P('p27')); assert.strictEqual(s.net.ospfAdj().length, 0); s.run('R2', 'en');
+  assert.ok(/No Hellos \(Passive interface\)/.test(text(s.sh.R2.exec('show ip ospf interface g0/1'))));
+  const r = s.run('R2', 'conf t', 'router ospf 1', 'no passive-interface g0/1');
+  assert.ok(/%OSPF-5-ADJCHG: Process 1, Nbr 1\.1\.1\.1 on GigabitEthernet0\/1 from LOADING to FULL, Loading Done/.test(text(r[2])), text(r[2]));
+  assert.ok(s.logs.some(([d, l]) => d === 'R1' && /Nbr 2\.2\.2\.2/.test(l[0].s)));
+});
+t('p28 area mismatch: ERRRCV on the area 0 side; after fix the LAN is O IA', () => {
+  const s = setup(P('p28')); const w = s.net.cdpWarnings();
+  assert.ok(w.some(x => x.dev === 'R1' && /mismatched area ID from backbone area must be virtual-link but not found from 10\.0\.12\.2, GigabitEthernet0\/1/.test(x.line)), JSON.stringify(w));
+  FIXES.p28(s); s.run('R1', 'en');
+  assert.ok(/O IA\s+192\.168\.2\.0\/24 \[110\/2\] via 10\.0\.12\.2/.test(text(s.sh.R1.exec('show ip route'))));
+});
+t('p29 hello mismatch shows in show ip ospf interface; matching R1 instead also works', () => {
+  let s = setup(P('p29')); s.run('R2', 'en');
+  assert.ok(/Hello 5, Dead 20/.test(text(s.sh.R2.exec('show ip ospf interface g0/1'))));
+  s = setup(P('p29')); s.run('R1', 'en', 'conf t', 'int g0/1', 'ip ospf hello-interval 5'); assert.ok(objOk(s.net, P('p29')).every(Boolean));
+});
+t('p30 wildcard 0.0.0.0 on the network address enables nothing; host match also fixes', () => {
+  let s = setup(P('p30')); s.run('R3', 'en');
+  const b = text(s.sh.R3.exec('show ip ospf interface brief')); assert.ok(/Gi0\/0/.test(b) && !/Gi0\/2/.test(b), b);
+  s = setup(P('p30')); s.run('R3', 'en', 'conf t', 'router ospf 1', 'network 10.0.23.2 0.0.0.0 area 0'); assert.ok(objOk(s.net, P('p30')).every(Boolean));
+});
+t('p31 ISP router is read-only; R1 has no gateway of last resort', () => {
+  const s = setup(P('p31')); assert.ok(/Access denied/.test(text(s.sh.ISP.exec('enable'))));
+  s.run('R1', 'en'); assert.ok(/Gateway of last resort is not set/.test(text(s.sh.R1.exec('show ip route'))));
+  assert.ok(/ip route 0\.0\.0\.0 0\.0\.0\.0 203\.0\.113\.1/.test(text(FIXES.p31(s) && s.sh.R1.exec('show run'))));
+});
+t('p32 no NAT inside: request leaves, reply dies at the ISP; R1 itself works', () => {
+  const s = setup(P('p32')); const r = s.net.ping('Office-PC', '198.51.100.10');
+  assert.strictEqual(r.stage, 'reply'); assert.strictEqual(r.at, 'ISP');
+  assert.ok(s.net.ping('R1', '198.51.100.10').ok);
+  FIXES.p32(s); s.net.ping('Office-PC', '198.51.100.10');
+  assert.ok(/icmp 203\.0\.113\.2:1\s+192\.168\.10\.21:1\s+198\.51\.100\.10:1/.test(text(s.sh.R1.exec('do show ip nat translations'))));
+});
+t('p33 NAT ACL for the old subnet translates nothing', () => {
+  const s = setup(P('p33')); assert.strictEqual(s.net.ping('Office-PC', '198.51.100.10').at, 'ISP');
+});
+t('p34 static NAT to the old address: ARP fails at R1; re-adding the same global needs the old one removed', () => {
+  const s = setup(P('p34')); const r = s.net.connect('Customer', '203.0.113.10', 80);
+  assert.strictEqual(r.at, 'R1'); assert.strictEqual(r.kind, 'arp'); assert.strictEqual(r.nh, '192.168.10.80');
+  assert.ok(/already mapped/.test(text(s.run('R1', 'en', 'conf t', 'ip nat inside source static 192.168.10.50 203.0.113.10')[2])));
+  s.run('R1', 'end'); assert.ok(/---\s+203\.0\.113\.10\s+192\.168\.10\.80/.test(text(s.sh.R1.exec('show ip nat translations'))));
+});
+t('p35 branch gets O*E2 default after default-information originate', () => {
+  const s = setup(P('p35')); s.run('R2', 'en'); assert.ok(/Gateway of last resort is not set/.test(text(s.sh.R2.exec('show ip route'))));
+  FIXES.p35(s); const rt = text(s.sh.R2.exec('show ip route'));
+  assert.ok(/O\*E2 0\.0\.0\.0\/0 \[110\/1\] via 10\.0\.12\.1/.test(rt) && /Gateway of last resort is 10\.0\.12\.1/.test(rt), rt);
+});
+t('p36 speed mismatch: link down at both ends; notconnect', () => {
+  const s = setup(P('p36')); assert.strictEqual(s.net.status('R1', 'GigabitEthernet0/0').protocol, 'down'); s.run('SW1', 'en');
+  assert.ok(/Gi0\/1\s+Uplink to R1\s+notconnect\s+1\s+auto\s+10/.test(text(s.sh.SW1.exec('show interfaces status'))));
+});
+t('p37 duplicate IP: ping "works" but reaches the printer; arp -a shows its MAC', () => {
+  const s = setup(P('p37')); const r = s.net.ping('Accounts-PC', '192.168.10.10');
+  assert.ok(r.ok); assert.strictEqual(r.dstDev, 'Printer');
+  s.sh['Accounts-PC'].exec('ping 192.168.10.10');
+  assert.ok(/192\.168\.10\.10\s+3c-d9-2b-5e-0a-17\s+dynamic/.test(text(s.sh['Accounts-PC'].exec('arp -a'))));
+  s.run('SW1', 'en'); assert.ok(/1\s+0050\.56a1\.10fe\s+DYNAMIC\s+Gi0\/1/.test(text(s.sh.SW1.exec('show mac address-table'))));
+});
+t('p38 ACL outbound on the guest side lets guests in; inbound blocks them', () => {
+  const s = setup(P('p38')); assert.ok(s.net.ping('Guest-Laptop', '10.10.10.20').ok);
+  FIXES.p38(s); assert.strictEqual(s.net.ping('Guest-Laptop', '10.10.10.20').kind, 'acl');
+});
+t('p39 floating static: primary gone (cut fibre), backup next hop outside the /29', () => {
+  const s = setup(P('p39')); s.run('R1', 'en');
+  assert.ok(!/10\.10\.0\.0/.test(text(s.sh.R1.exec('show ip route'))));
+  FIXES.p39(s); assert.ok(/S\s+10\.10\.0\.0\/16 \[250\/0\] via 10\.0\.13\.3/.test(text(s.sh.R1.exec('do show ip route'))));
+  s.net.links.find(l => l.cut).cut = false; s.net.touch();
+  assert.ok(/S\s+10\.10\.0\.0\/16 \[1\/0\] via 10\.0\.12\.2/.test(text(s.sh.R1.exec('do show ip route'))), 'fibre back: primary wins again');
+});
+t('p40 static (AD 1) hides the OSPF route (AD 110)', () => {
+  const s = setup(P('p40')); s.run('R1', 'en'); const rt = text(s.sh.R1.exec('show ip route'));
+  assert.ok(/S\s+192\.168\.2\.0\/24 \[1\/0\] via 10\.0\.99\.2/.test(rt) && !/O\s+192\.168\.2\.0/.test(rt), rt);
+  assert.strictEqual(s.net.ping('HQ-PC', '192.168.2.20').at, 'Old-MPLS');
+});
+t('p41 typo address: request gets out, reply has nowhere to go', () => {
+  const s = setup(P('p41')); const r = s.net.connect('Reception-PC', '10.4.4.40', 80);
+  assert.strictEqual(r.stage, 'reply'); assert.strictEqual(r.at, 'R1');
+});
+t('p42 needs both the trunk and the subinterface', () => {
+  let s = setup(P('p42')); s.run('SW1', 'en', 'conf t', 'int g0/1', 'switchport trunk allowed vlan add 30'); assert.ok(!objOk(s.net, P('p42'))[0]);
+  s = setup(P('p42')); s.run('R1', 'en', 'conf t', 'interface g0/0.30', 'encapsulation dot1Q 30', 'ip address 192.168.30.1 255.255.255.0'); assert.ok(!objOk(s.net, P('p42'))[0]);
+});
+t('p43 relay reaches the server, but the offer cannot return', () => {
+  const s = setup(P('p43')); assert.ok(!s.net.dhcp('Remote-Laptop', false).ok);
+  assert.ok(s.net.route('R2', '10.1.1.5', { srcIP: '192.168.70.1' }).ok, 'request gets to the server');
+  assert.ok(!s.net.ping('DC-Server', '192.168.70.1').ok);
+});
+t('p44 each half of the fix repairs one VLAN', () => {
+  const s = setup(P('p44')); s.run('SW1', 'en', 'conf t', 'int g0/1', 'switchport trunk native vlan 1'); assert.deepStrictEqual(objOk(s.net, P('p44')), [true, false]);
+});
+t('p45 layered: neighbours first, then the default route', () => {
+  const s = setup(P('p45')); s.run('R2', 'en', 'conf t', 'router ospf 1', 'no passive-interface g0/1');
+  assert.deepStrictEqual(objOk(s.net, P('p45')), [true, false, true]);
 });
 
 // ---------- CLI behaviour ----------
