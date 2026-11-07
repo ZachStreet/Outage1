@@ -9,6 +9,7 @@ Daily broken-network puzzles with a leaderboard. Something's down.
 | `build.js` | Builds `src/` into `public/index.html`, the page Netlify serves |
 | `netlify/functions/scores.mjs` | The leaderboard API at `/api/scores` |
 | `lib/board.mjs` | Leaderboard rules: validation, best run per outage, ranking |
+| `netlify/functions/track.mjs`, `lib/track.mjs` | Anonymous visit tracking at `/api/track`, shown on the `#stats` page |
 | `test/` | Tests. `npm test` for the engine and leaderboard, `npm run test:e2e` for the browser test |
 | `netlify.toml` | Tells Netlify how to build: `npm run build`, publish `public`, functions in `netlify/functions` |
 
@@ -30,7 +31,15 @@ The home page is a rack with one switch per day, newest on top. Each switch hold
 
 A day appears on its date, in each player's own time zone, so you can add several days in advance. The leaderboard picks up new outages automatically.
 
-What the simulator supports: access ports, VLANs, 802.1Q trunks (allowed lists, native VLAN, CDP mismatch logs), router interfaces, subinterfaces for router-on-a-stick, static and default routes with longest-prefix matching, ARP, ping and tracert, and PC IP settings.
+What the simulator supports: access ports, VLANs, 802.1Q trunks (allowed lists, native VLAN, DTP auto/desirable, CDP mismatch logs), speed and duplex negotiation, port security and BPDU Guard with err-disabled ports, router interfaces and router-on-a-stick subinterfaces, static and default routes with longest-prefix matching and routing loops, standard, extended and named ACLs, ARP, ping, tracert, `curl` and `tnc` (TCP port tests) on PCs, and PC IP settings.
+
+Test points can be a ping, a TCP port (`port: 80` runs `curl`, other ports run `tnc`), and can be marked `blocked: true` when the traffic must stay blocked. Use those to stop lazy fixes, like deleting an ACL, from passing. `boot` adds log lines a device printed before the player arrived.
+
+## Who's playing: the stats page
+
+Open `https://<your-site>.netlify.app/#stats`. It isn't linked anywhere. It shows visitors per day, how many were new or returning, how many came back on another day, and how many people started and fixed each outage.
+
+Each browser gets a random anonymous id. The server stores only a hash of it, with the dates it visited and which outages it opened and fixed: no names, no IP addresses. Days are counted in Brisbane time. The data lives in a Netlify Blobs store named `outage-visitors`.
 
 ## Run it on your computer (optional)
 

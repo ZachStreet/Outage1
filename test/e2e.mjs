@@ -8,6 +8,7 @@ import assert from 'node:assert';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { makeHandler } from '../lib/board.mjs';
+import { makeTrackHandler } from '../lib/track.mjs';
 import { memoryStore } from './memory-store.mjs';
 
 const require = createRequire(import.meta.url);
@@ -17,12 +18,14 @@ const shots = process.argv[2];
 const html = fs.readFileSync(path.join(dir, '..', 'public', 'index.html'));
 const store = memoryStore();
 const handler = makeHandler(() => store);
+const trackStore = memoryStore();
+const tracker = makeTrackHandler(() => trackStore);
 const PORT = 8767, BASE = `http://localhost:${PORT}/`;
 
 const server = http.createServer(async (req, res) => {
-  if (req.url.startsWith('/api/scores')) {
+  if (req.url.startsWith('/api/scores') || req.url.startsWith('/api/track')) {
     const chunks = []; for await (const c of req) chunks.push(c);
-    const r = await handler(new Request('http://localhost' + req.url, { method: req.method, headers: req.headers, body: req.method === 'GET' ? undefined : Buffer.concat(chunks) }));
+    const r = await (req.url.startsWith('/api/track') ? tracker : handler)(new Request('http://localhost' + req.url, { method: req.method, headers: req.headers, body: req.method === 'GET' ? undefined : Buffer.concat(chunks) }));
     res.writeHead(r.status, Object.fromEntries(r.headers)); res.end(Buffer.from(await r.arrayBuffer()));
   } else { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(html); }
 }).listen(PORT);
@@ -38,8 +41,19 @@ const FIX = {
   p7: [['R1', ['en', 'conf t', 'int g0/1', 'no ip address', 'int g0/2', 'ip address 192.168.40.1 255.255.255.0']]],
   p8: [['SW1', ['en', 'conf t', 'int g0/1', 'sw tr nat vl 1']]],
   p9: [['R1', ['en', 'conf t', 'interface g0/0.20', 'encapsulation dot1Q 20']]],
-  p10: [['R1', ['en', 'conf t', 'no ip route 172.16.50.128 255.255.255.128 10.0.0.3']]]
+  p10: [['R1', ['en', 'conf t', 'no ip route 172.16.50.128 255.255.255.128 10.0.0.3']]],
+  p11: [['SW1', ['en', 'conf t', 'int fa0/6', 'speed auto', 'duplex auto']]],
+  p12: [['R2', ['en', 'conf t', 'int g0/1', 'ip address 10.0.0.2 255.255.255.252']]],
+  p13: [['SW1', ['en', 'conf t', 'int fa0/3', 'no switchport port-security mac-address sticky 54bf.6403.91e2', 'shutdown', 'no shutdown']]],
+  p14: [['SW2', ['en', 'conf t', 'int g0/1', 'switchport mode trunk']]],
+  p15: [['R2', ['en', 'conf t', 'no ip route 172.16.30.0 255.255.255.0 10.0.12.1', 'ip route 172.16.30.0 255.255.255.0 10.0.23.2']]],
+  p16: [['SW1', ['en', 'conf t', 'int fa0/5', 'no spanning-tree portfast', 'spanning-tree bpduguard disable', 'shutdown', 'no shutdown']]],
+  p17: [['R1', ['en', 'conf t', 'access-list 10 permit 192.168.20.0 0.0.0.255']]],
+  p18: [['R1', ['en', 'conf t', 'access-list 110 permit tcp any host 10.20.0.10 eq www']]],
+  p19: [['R1', ['en', 'conf t', 'ip access-list extended GUEST-IN', 'no 20', '5 permit ip 192.168.50.0 0.0.0.255 host 10.30.0.40']]],
+  p20: [['R1', ['en', 'conf t', 'no access-list 15', 'access-list 15 permit 192.168.99.0 0.0.0.255']]]
 };
+const N = Object.keys(FIX).length;
 const tab = (page, dev) => page.locator('#tabs .tab').filter({ hasText: new RegExp('^' + dev.replace(/[-]/g, '\\-') + '(router|switch|PC|server|printer|camera)$') });
 async function solve(page, id, { hint = false } = {}) {
   await page.goto(BASE + '#' + id);
@@ -76,18 +90,18 @@ let fails = 0;
 const t = async (name, fn) => { try { await fn(); console.log('ok   ' + name); } catch (e) { fails++; console.log('FAIL ' + name + '\n     ' + e.message.split('\n')[0]); } };
 const browser = await chromium.launch();
 const errors = [];
-const ctx = async o => { const c = await browser.newContext(Object.assign({ reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } }, o || {})); await c.clock.setFixedTime(new Date('2026-11-03T10:00:00+10:00')); return c; };
+const ctx = async o => { const c = await browser.newContext(Object.assign({ reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } }, o || {})); await c.clock.setFixedTime(new Date('2026-11-08T10:00:00+10:00')); return c; };
 const watch = p => { p.on('pageerror', e => errors.push(e.message)); return p; };
 const shot = (p, f, o) => shots ? p.screenshot(Object.assign({ path: path.join(shots, f) }, o || {})) : null;
 
 const a = watch(await (await ctx()).newPage());
 await a.goto(BASE);
 
-await t('rack: one switch per day, newest on top, ten ports', async () => {
-  assert.deepStrictEqual(await a.$$eval('.unit[data-day]', us => us.map(u => u.dataset.day)), ['2', '1']);
-  assert.strictEqual(await a.locator('.rack .port').count(), 10);
-  assert.match(await a.textContent('.unit[data-day="2"] .u-date'), /Today/);
-  assert.match(await a.textContent('#detail'), /Day 2.*Port 1[\s\S]*Spring Clean/);
+await t('rack: one switch per day, newest on top, five ports each', async () => {
+  assert.deepStrictEqual(await a.$$eval('.unit[data-day]', us => us.map(u => u.dataset.day)), ['4', '3', '2', '1']);
+  assert.strictEqual(await a.locator('.rack .port').count(), N);
+  assert.match(await a.textContent('.unit[data-day="4"] .u-date'), /Today/);
+  assert.match(await a.textContent('#detail'), /Day 4.*Port 1[\s\S]*Desk Switch/);
   await shot(a, 'home.png', { fullPage: true });
 });
 await t('rack: picking a Day 1 port updates the detail', async () => {
@@ -106,7 +120,7 @@ await t('a day stays hidden until its date', async () => {
   await p.goto(BASE + '#p6'); assert.ok(await p.isVisible('#home'), 'future outage opens the panel instead');
   await c.close();
 });
-for (let i = 1; i <= 10; i++) {
+for (let i = 1; i <= N; i++) {
   await t(`p${i}: map labels don't overlap`, async () => {
     await a.goto(BASE + '#p' + i); await a.waitForSelector('#play:not([hidden])');
     assert.deepStrictEqual(await overlaps(a), []);
@@ -125,21 +139,37 @@ await t('p9: subinterface prompt', async () => {
   assert.strictEqual(await a.textContent('#prompt'), 'R1(config-subif)#');
 });
 
+await t('p13: SW1 console shows the port-security violation on open', async () => {
+  await a.goto(BASE + '#p13'); await a.waitForSelector('#play:not([hidden])');
+  await tab(a, 'SW1').click();
+  assert.match(await a.textContent('#screen'), /%PORT_SECURITY-2-PSECURE_VIOLATION: Security violation occurred, caused by MAC address 54bf\.6411\.2a7c/);
+});
+await t('p18: web and SSH test points run curl and tnc; SSH counts as passing when blocked', async () => {
+  await a.goto(BASE + '#p18'); await a.waitForSelector('#play:not([hidden])');
+  assert.deepStrictEqual(await a.$$eval('#obj .t-cmd', e => e.map(x => x.textContent)), ['Staff-PC: curl http://10.20.0.10', 'Dev-PC: ping 10.20.0.10', 'Staff-PC: tnc 10.20.0.10 -port 22 should fail']);
+  await a.click('#obj li:nth-child(3) button'); await a.waitForTimeout(60);
+  assert.match(await a.getAttribute('#obj li:nth-child(3) .led', 'class'), /led-g/);
+  assert.match(await a.textContent('#wire-text'), /Blocked, as it should be/);
+  await a.click('#obj li:nth-child(1) button'); await a.waitForTimeout(60);
+  assert.match(await a.textContent('#screen'), /curl: \(28\) Failed to connect/);
+  assert.match(await a.getAttribute('#obj li:nth-child(1) .led', 'class'), /led-r/);
+});
+
 // Player 1 fixes everything. The first win asks for a name; later wins post automatically.
-await t('player 1 fixes all ten outages through the UI', async () => {
-  for (let i = 1; i <= 10; i++) {
+await t(`player 1 fixes all ${N} outages through the UI`, async () => {
+  for (let i = 1; i <= N; i++) {
     const id = 'p' + i;
     await solve(a, id);
     if (i === 1) { await a.fill('#post-name', 'Zach'); await a.click('#post-form button[type=submit]'); }
     await a.waitForSelector('#post-see');
     if (i === 8) await shot(a, 'win-p8.png');
     const next = await a.isVisible('#win-next');
-    assert.strictEqual(next, i < 10, id + ' next button');
+    assert.strictEqual(next, i < N, id + ' next button');
   }
 });
-await t('rack shows both days fixed', async () => {
+await t('rack shows every day fixed', async () => {
   await a.goto(BASE); await a.waitForSelector('.unit');
-  assert.deepStrictEqual(await a.$$eval('.unit[data-day] .u-count', e => e.map(x => x.textContent)), ['5/5 up', '5/5 up']);
+  assert.deepStrictEqual(await a.$$eval('.unit[data-day] .u-count', e => e.map(x => x.textContent)), ['5/5 up', '5/5 up', '5/5 up', '5/5 up']);
   assert.strictEqual(await a.locator('.rack .port .led-r').count(), 0);
   assert.match(await a.getAttribute('#brand-led', 'class'), /led-g/);
 });
@@ -153,8 +183,8 @@ await t('player 2 posts a Day 2 run with an escalation', async () => {
 });
 await t('leaderboard: all days', async () => {
   const rows = await b.$$eval('table.lb tbody tr', rs => rs.map(r => Array.from(r.cells).map(c => c.textContent.trim())));
-  assert.strictEqual(rows[0][1], 'Zach'); assert.strictEqual(rows[0][2], '10/10'); assert.strictEqual(rows[1][2], '1/10');
-  assert.deepStrictEqual(await b.$$eval('table.lb thead th small', e => e.map(x => x.textContent)), ['Day 2', 'Day 1']);
+  assert.strictEqual(rows[0][1], 'Zach'); assert.strictEqual(rows[0][2], `${N}/${N}`); assert.strictEqual(rows[1][2], `1/${N}`);
+  assert.deepStrictEqual(await b.$$eval('table.lb thead th small', e => e.map(x => x.textContent)), ['Day 4', 'Day 3', 'Day 2', 'Day 1']);
   await shot(b, 'board-all.png', { fullPage: true });
 });
 await t('leaderboard: one day, then one outage', async () => {
@@ -170,9 +200,19 @@ await t('leaderboard: one day, then one outage', async () => {
   assert.deepStrictEqual(await b.$$eval('table.lb tbody tr .who', e => e.map(x => x.textContent)), ['Zach']);
   await shot(b, 'board-p3.png', { fullPage: true });
 });
+await t('stats page counts visitors, starts and fixes', async () => {
+  await b.goto(BASE + '#stats');
+  await b.waitForSelector('.stat-tiles');
+  assert.ok(await b.isVisible('#stats') && /XP/.test(await b.textContent('#stats')), 'header stats stay visible');
+  const tiles = await b.$$eval('.stat-tiles .lcd', e => e.map(x => x.textContent));
+  assert.ok(+tiles[0] >= 2, tiles.join(','));
+  const p1 = await b.$$eval('#stats-body table:last-of-type tbody tr', rs => rs.map(r => Array.from(r.cells).map(c => c.textContent)).find(c => /Lights Out/.test(c[0])));
+  assert.ok(p1 && +p1[2] >= 1, String(p1));
+  await shot(b, 'stats.png', { fullPage: true });
+});
 await t('phone, dark mode: no sideways scroll on home, a map or the board', async () => {
   const m = watch(await (await ctx({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' })).newPage());
-  for (const h of ['', '#p9', '#leaderboard']) {
+  for (const h of ['', '#p9', '#p19', '#leaderboard', '#stats']) {
     await m.goto(BASE + h); await m.waitForTimeout(150);
     assert.strictEqual(await m.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth), 0, h || 'home');
   }

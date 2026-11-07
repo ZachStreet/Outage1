@@ -368,3 +368,8 @@ table.lb { width: 100%; border-collapse: collapse; font-size: 14.5px; min-width:
 .post-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 
 @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
+.t-cmd b { font-weight: 600; color: var(--ink); }
+.stat-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 26px 0 8px; }
+.stat-tiles > div { background: var(--face); border-radius: 6px; box-shadow: var(--lift); padding: 14px 16px; display: grid; gap: 6px; }
+.stats-h { font-size: 15px; font-weight: 700; font-stretch: 85%; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); margin: 26px 0 10px; }
+@media (max-width: 560px) { .stat-tiles { grid-template-columns: 1fr; } }
