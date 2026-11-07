@@ -373,3 +373,5 @@ table.lb { width: 100%; border-collapse: collapse; font-size: 14.5px; min-width:
 .stat-tiles > div { background: var(--face); border-radius: 6px; box-shadow: var(--lift); padding: 14px 16px; display: grid; gap: 6px; }
 .stats-h { font-size: 15px; font-weight: 700; font-stretch: 85%; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); margin: 26px 0 10px; }
 @media (max-width: 560px) { .stat-tiles { grid-template-columns: 1fr; } }
+.c-link.is-cut { stroke-dasharray: 3 10; opacity: 0.55; }
+.ipset-row { flex-wrap: wrap; }

@@ -316,7 +316,7 @@
     net.links.forEach((l, i) => {
       const A = net.devices[l.a], B = net.devices[l.b];
       const up = net.linkUp(i) && net.status(l.a, l.ai).protocol === 'up';
-      s += `<line class="c-link c-${cableType(net, l)}${up ? '' : ' is-down'}" x1="${A.x}" y1="${A.y}" x2="${B.x}" y2="${B.y}"/>`;
+      s += `<line class="c-link c-${cableType(net, l)}${up ? '' : ' is-down'}${l.cut ? ' is-cut' : ''}" x1="${A.x}" y1="${A.y}" x2="${B.x}" y2="${B.y}"><title>${l.cut ? 'Cable cut: a fault outside your control' : esc(l.a + ' to ' + l.b)}</title></line>`;
     });
     L.ports.forEach(pl => {
       const e = pl.e, st = net.status(e.dn, e.ifn);
@@ -382,6 +382,7 @@
     if (r.ok) mark(from, 'mk-ok', '✓'); else mark(r.at, 'mk-bad', '×');
   }
   function describe(from, r) {
+    if (r.dhcp) return r.ok ? ['ok', `${from} got ${r.lease.ip} from ${r.lease.server}${r.lease.gw ? ', gateway ' + r.lease.gw : ''}.`] : ['bad', `No DHCP server answered ${from}’s broadcast, so it gave itself a 169.254 address.`];
     const what = r.port === 80 ? 'The web page loaded' : r.port ? `Port ${r.port} answered` : `Reply from ${r.dst}`;
     if (r.ok && r.lossy) return ['bad', `Replies came back from ${r.dstDev}, but some were lost on the way. Something on the path is damaging packets.`];
     if (r.ok) return ['ok', `${what}. The round trip from ${from} to ${r.dstDev} and back works.`];
@@ -409,7 +410,8 @@
     Object.keys(G.net.devices).forEach(n => {
       const b = document.createElement('button');
       b.type = 'button'; b.className = 'tab'; b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', String(n === G.active));
-      b.innerHTML = `${esc(n)}<span class="tab-kind">${KIND[G.net.devices[n].type]}</span>`;
+      const dv = G.net.devices[n];
+      b.innerHTML = `${esc(n)}<span class="tab-kind">${dv.locked ? 'ISP, read-only' : dv.l3 ? 'L3 switch' : KIND[dv.type]}</span>`;
       b.onclick = () => select(n, true);
       tabs.appendChild(b);
     });
@@ -469,16 +471,17 @@
     tickStats();
   }
   function onPing(pg) {
-    const r = pg.res, o = G.obj.find(x => x.from === pg.from && x.to === pg.to && (x.port || null) === (pg.port || null));
-    const pass = o ? G.net.passes(o, r) : r.ok;
+    const r = pg.res, o = G.obj.find(x => x.from === pg.from && (pg.dhcp ? x.dhcp : !x.dhcp && x.to === pg.to && (x.port || null) === (pg.port || null)));
+    const pass = o ? G.net.passes(o, o.dhcp ? G.net.test(o, true) : r) : r.ok;
     if (o) { G.tries.push(pass); o.state = pass ? 'pass' : 'fail'; renderObjectives(); }
     let [tone, text] = describe(pg.from, r);
     // A test point that should be blocked passes when the traffic is stopped.
     if (o && o.blocked) { tone = pass ? 'ok' : 'bad'; text = pass ? 'Blocked, as it should be. ' + text : 'That got through, and it shouldn’t have. ' + text; }
-    setStatus('busy', `Tracing ${pg.from} to ${pg.to}…`);
+    if (o && o.dev && r.ok && r.dstDev !== o.dev) { tone = 'bad'; text = `A reply came back from ${r.dst}, but it came from ${r.dstDev}, not ${o.dev}.`; }
+    setStatus('busy', pg.dhcp ? `${pg.from} is broadcasting for a DHCP server…` : `Tracing ${pg.from} to ${pg.to}…`);
     animate(pg.from, r).then(() => { if (!G) return; setStatus(tone, text); if (o && pass) checkWin(); });
   }
-  const testCmd = o => o.port === 80 ? 'curl http://' + o.to : o.port ? `tnc ${o.to} -port ${o.port}` : 'ping ' + o.to;
+  const testCmd = o => o.dhcp ? 'ipconfig /renew' : o.port === 80 ? 'curl http://' + o.to : o.port ? `tnc ${o.to} -port ${o.port}` : 'ping ' + o.to;
   function testObjective(o) {
     if (G.solved) return;
     G.pcTab = 'cmd'; select(o.from, false);
@@ -524,10 +527,21 @@
     if (!isMask(mask)) return bad('Enter a subnet mask like 255.255.255.0.');
     if (gw && !isIP(gw)) return bad('Enter the gateway as an IPv4 address, or leave it empty.');
     const d = G.net.devices[G.active];
-    d.ip = ip; d.mask = mask; d.gw = gw || null; G.net.touch(); G.cmds++;
-    msg.textContent = 'Settings saved. Run ipconfig in the command prompt to check them.'; msg.className = 'ipset-msg';
+    Object.assign(d, { ip, mask, gw: gw || null, dhcp: false, apipa: false, lease: null }); G.net.touch(); G.cmds++;
+    msg.textContent = 'Static settings saved. Run ipconfig in the command prompt to check them.'; msg.className = 'ipset-msg';
     renderTopo(); tickStats();
   });
+  // Switching a PC to DHCP asks for an address straight away, as Windows does.
+  $('#ip-dhcp').onclick = () => {
+    if (!G || G.solved) return;
+    const d = G.net.devices[G.active], msg = $('#ip-msg');
+    d.dhcp = true; G.cmds++;
+    const r = G.net.dhcp(G.active, true);
+    renderPane();
+    $('#ip-msg').textContent = r.ok ? `DHCP gave this PC ${d.ip}${d.gw ? ', gateway ' + d.gw : ''}.` : 'No DHCP server answered, so the PC gave itself a 169.254 address.';
+    $('#ip-msg').className = 'ipset-msg' + (r.ok ? '' : ' err');
+    renderTopo(); tickStats();
+  };
 
   // ---------- escalations, win ----------
   $('#hint-btn').onclick = () => { if (!G || G.hints >= G.p.hints.length) return; G.hints++; renderHints(); tickStats(); };
